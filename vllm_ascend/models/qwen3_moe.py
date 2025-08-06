@@ -139,7 +139,6 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         return hidden_states
 
-
 class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
     def __init__(

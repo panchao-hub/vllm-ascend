@@ -262,13 +262,9 @@ class CustomQwen2Model(Qwen2Model):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = []
-        for idx, layer in enumerate(
-                self.layers[self.start_layer:self.end_layer]):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[idx]
-            kv_cache = kv_caches[idx - self.start_layer] \
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            kv_cache = kv_caches[i - self.start_layer] \
                 if kv_caches is not None else None
             hidden_states, residual = layer(positions,
                                             hidden_states,
@@ -283,10 +279,6 @@ class CustomQwen2Model(Qwen2Model):
             })
 
         hidden_states, _ = self.norm(hidden_states, residual)
-
-        if len(aux_hidden_states) > 0:
-            return hidden_states, aux_hidden_states
-
         return hidden_states
 
 
