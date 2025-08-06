@@ -16,7 +16,7 @@
 # limitations under the License.
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Union
 
 import torch
 import vllm.envs as envs
@@ -139,6 +139,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         return hidden_states
 
+
 class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
     def __init__(
@@ -245,8 +246,8 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
             if envs.VLLM_USE_V1:
                 output_shape = q.shape
                 output = torch.empty(output_shape,
-                                        dtype=q.dtype,
-                                        device=q.device)
+                                     dtype=q.dtype,
+                                     device=q.device)
                 forward_kwargs['output'] = output
 
             attn_output = self.attn.impl.forward(self.attn,
