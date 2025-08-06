@@ -22,6 +22,7 @@ import torch
 import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CompilationLevel, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -30,9 +31,12 @@ from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models.interfaces import (MixtureOfExperts,
@@ -55,10 +59,9 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from vllm.sequence import IntermediateTensors
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-
-
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.sequence_parallel import (MetadataForPadding,
                                                init_metadata_for_sp)
@@ -136,6 +139,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         return hidden_states
 
+
 class CustomQwen3MoeAttention(Qwen3MoeAttention):
 
     def __init__(
@@ -211,12 +215,11 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        kv_cache: Optional[torch.Tensor] = None,
-        attn_metadata: Optional[AttentionMetadata] = None
-    ) -> torch.Tensor:
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            kv_cache: Optional[torch.Tensor] = None,
+            attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -232,10 +235,13 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
 
-        if (self.torchair_graph_enabled and
-            attn_metadata is not None and
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly):
-            q, k = self.rotary_emb(positions, q, k, is_prefill=False, is_qwen_torchair=True)
+        if (self.torchair_graph_enabled and attn_metadata is not None and
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly):
+            q, k = self.rotary_emb(positions,
+                                   q,
+                                   k,
+                                   is_prefill=False,
+                                   is_qwen_torchair=True)
             forward_kwargs = {}
             if envs.VLLM_USE_V1:
                 output_shape = q.shape
@@ -259,6 +265,7 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
             attn_output = self.attn(q, k, v)
             output, _ = self.o_proj(attn_output)
             return output
+
 
 class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
@@ -438,9 +445,7 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
+                positions, hidden_states, residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
                 attn_metadata,

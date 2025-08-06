@@ -19,9 +19,9 @@ import math
 from typing import Optional, Tuple
 
 import torch
-import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_npu
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
 
@@ -43,7 +43,8 @@ def rope_forward_oot(
     is_neox_style_override: Optional[bool] = None,
     is_qwen_torchair: Optional[bool] = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if get_ascend_config().torchair_graph_config.enabled and not is_qwen_torchair:
+    if get_ascend_config(
+    ).torchair_graph_config.enabled and not is_qwen_torchair:
         return self.forward_native(
             positions,
             query,
@@ -248,6 +249,7 @@ def _set_cos_sin_cache(self, seq_len, device, dtype):
     self.register_buffer("cos_cached", cos_cached, persistent=False)
     self.register_buffer("sin_cached", sin_cached, persistent=False)
 
+
 def __set_cos_sin_cache(self, seq_len, device, dtype):
     inv_freq = 1.0 / (self.base**(torch.arange(
         0, self.rotary_dim, 2, device=device, dtype=torch.float32) *
@@ -263,6 +265,7 @@ def __set_cos_sin_cache(self, seq_len, device, dtype):
     self.register_buffer("cos", emb.cos().to(dtype=dtype), persistent=False)
     self.register_buffer("sin", emb.sin().to(dtype=dtype), persistent=False)
     self.embed = F.embedding
+
 
 def qwen_rope_init_func(
     self,
@@ -290,6 +293,7 @@ def qwen_rope_init_func(
                             seq_len=max_position_embeddings,
                             device="npu",
                             dtype=dtype)
+
 
 def rope_forward(
     self,
@@ -372,6 +376,7 @@ def deepseek_rope_init_func(
                        max_position_embeddings,
                        dtype=dtype,
                        device="npu")
+
 
 RotaryEmbedding.__init__ = qwen_rope_init_func
 RotaryEmbedding.forward_oot = rope_forward
