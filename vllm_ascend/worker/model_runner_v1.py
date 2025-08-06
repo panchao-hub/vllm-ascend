@@ -98,6 +98,7 @@ import vllm.envs as envs_vllm
 
 import vllm_ascend.envs as envs_ascend
 
+VLLM_USE_ACL_GRAPH = os.environ.get("VLLM_USE_ACL_GRAPH", 0)
 
 @dataclass
 class GraphCaptureContext:
@@ -1154,6 +1155,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             attn_metadata.decode.input_positions)
                         torch._dynamo.mark_static(attn_metadata.decode.sin)
                         torch._dynamo.mark_static(attn_metadata.decode.cos)
+                    torch._dynamo.mark_static(
+                        get_forward_context().mc2_mask)
                     torch._dynamo.mark_static(attn_metadata.slot_mapping)
                     for kv in self.kv_caches:
                         assert isinstance(kv,
@@ -1754,8 +1757,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 attn_metadata.decode.input_positions)
                             torch._dynamo.mark_static(attn_metadata.decode.sin)
                             torch._dynamo.mark_static(attn_metadata.decode.cos)
-                            torch._dynamo.mark_static(
-                                get_forward_context().mc2_mask)
+                        torch._dynamo.mark_static(
+                            get_forward_context().mc2_mask)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
                         if self.speculative_config:
                             torch._dynamo.mark_static(
