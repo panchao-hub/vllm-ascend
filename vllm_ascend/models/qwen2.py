@@ -27,8 +27,7 @@ from transformers import Qwen2Config
 from vllm.attention import AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-
-                    tensor_model_parallel_all_gather,
+from vllm.distributed import (get_pp_group, tensor_model_parallel_all_gather,
                               tensor_model_parallel_reduce_scatter)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
