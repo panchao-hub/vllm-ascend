@@ -50,6 +50,7 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer, extract_layer_index,
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
