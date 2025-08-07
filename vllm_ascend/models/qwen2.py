@@ -32,6 +32,7 @@ from vllm.distributed import (get_pp_group, tensor_model_parallel_all_gather,
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.qwen2 import Qwen2Attention  # noqa: F401
@@ -41,7 +42,6 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               PPMissingLayer, maybe_prefix)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
@@ -130,7 +130,10 @@ class CustomQwen2Attention(Qwen2Attention):
             output, _ = self.o_proj(attn_output)
             return output
         else:
-            q, k = self.rotary_emb(positions, q, k, is_qwen_torchair=True)
+            if isinstance(self.rotary_emb, RotaryEmbedding):
+                q, k = self.rotary_emb(positions, q, k, is_qwen_torchair=True)
+            else:
+                q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
             output, _ = self.o_proj(attn_output)
             return output
