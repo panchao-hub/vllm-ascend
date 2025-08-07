@@ -50,16 +50,6 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer, extract_layer_index,
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 from vllm.sequence import IntermediateTensors
-
-from vllm.attention import AttentionMetadata
-from vllm.attention import Attention
-from vllm.distributed import get_pp_group
-from vllm.model_executor.layers.linear import (QKVParallelLinear,
-                                               RowParallelLinear)
-from vllm.model_executor.layers.rotary_embedding import get_rope
-
-from vllm.sequence import IntermediateTensors
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
@@ -382,7 +372,9 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
         if not self.use_aclgraph:
             hidden_states = self.mlp(
-                hidden_states, attn_metadata, _metadata_for_padding=_metadata_for_padding)
+                hidden_states,
+                attn_metadata,
+                _metadata_for_padding=_metadata_for_padding)
         else:
             hidden_states = self.mlp(hidden_states)
 
@@ -445,7 +437,9 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions, hidden_states, residual,
+                positions,
+                hidden_states,
+                residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
                 attn_metadata,
