@@ -131,7 +131,7 @@ class CustomQwen2Attention(Qwen2Attention):
             output, _ = self.o_proj(attn_output)
             return output
         else:
-            if isinstance(self.rotary_emb, RotaryEmbedding):
+            if type(self.rotary_emb) is RotaryEmbedding:
                 q, k = self.rotary_emb(positions, q, k, is_qwen_torchair=True)
             else:
                 q, k = self.rotary_emb(positions, q, k)
