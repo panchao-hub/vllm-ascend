@@ -780,10 +780,7 @@ def fused_experts(
                             num_experts)).to(topk_ids.dtype)
 
         # Sort by local expert IDs
-        if get_ascend_config().torchair_graph_config.enabled:
-            sort_indices = torch.argsort(filtered_experts)
-        else:
-            sort_indices = torch.argsort(filtered_experts.view(torch.float32))
+        sort_indices = torch.argsort(filtered_experts.view(torch.float32))
         sorted_token_indices = token_indices[sort_indices]
         sorted_weights = filtered_weights[sort_indices]
 
