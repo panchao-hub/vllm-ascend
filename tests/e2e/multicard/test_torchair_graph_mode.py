@@ -213,6 +213,9 @@ def _qwen_torchair_test_fixture(
         print(f"Generated text: {vllm_output[i][1]!r}")
 
 
-def test_e2e_qwen_with_torchair():
-    _qwen_torchair_test_fixture("Qwen/Qwen3-30B-A3B", True)
+def test_e2e_qwen2_with_torchair():
     _qwen_torchair_test_fixture("Qwen/Qwen2.5-0.5B-Instruct", False)
+
+
+def test_e2e_qwen3_moe_with_torchair():
+    _qwen_torchair_test_fixture("Qwen/Qwen3-30B-A3B", True)
