@@ -14,11 +14,11 @@
 #
 import math
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
-
 from vllm_ascend.models.qwen3_moe import (CustomQwen3MoeAttention,
                                           CustomQwen3MoeForCausalLM)
 
@@ -50,6 +50,18 @@ class TestCustomQwen3MoeForCausalLM:
         assert CustomQwen3MoeForCausalLM.packed_modules_mapping == expected_mapping
 
 
+class DummyRMSNorm:
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        self.dim = dim
+        self.eps = eps
+
+    def __call__(self, x):
+        mean_sq = x.pow(2).mean(dim=-1, keepdim=True)
+        denom = (mean_sq + self.eps).sqrt()
+        return x / denom
+
+
 class TestCustomQwen3MoeAttention(unittest.TestCase):
 
     def setUp(self):
@@ -66,6 +78,7 @@ class TestCustomQwen3MoeAttention(unittest.TestCase):
                                 dtype=torch.float32).reshape(
                                     self.batch, self.seq_len, total_dim)
 
+    @patch('vllm.model_executor.layers.layernorm.RMSNorm', new=DummyRMSNorm)
     def test_constant_input_normalization(self):
         ones_qkv = torch.ones((1, 1, self.q_size + 2 * self.kv_size),
                               dtype=torch.float32)
