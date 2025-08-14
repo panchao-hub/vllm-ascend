@@ -17,6 +17,7 @@
 from typing import List, Optional
 
 import torch
+from torch.distributed import ReduceOp
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import \
     DeviceCommunicatorBase
@@ -73,3 +74,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         dist.all_to_all(output_list, input_list, group=self.device_group)
         output_tensor = torch.cat(output_list, dim=gather_dim).contiguous()
         return output_tensor
+
+    def all_reduce(self, input_: torch.Tensor, op: ReduceOp = ReduceOp.SUM) -> torch.Tensor:
+        dist.all_reduce(input_, op=op, group=self.group)
+        return input_

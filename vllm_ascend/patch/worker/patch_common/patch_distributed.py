@@ -18,6 +18,7 @@
 from typing import List, Optional
 
 import torch
+from torch.distributed import ReduceOp
 import vllm
 from vllm.distributed.parallel_state import GroupCoordinator
 
@@ -44,6 +45,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
         return self.device_communicator.all_to_all(input_, scatter_dim,
                                                    gather_dim, scatter_sizes,
                                                    gather_sizes)
+
+    def all_reduce(self, input_: torch.Tensor, op=ReduceOp.SUM) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return self.device_communicator.all_reduce(input_, op=op)
 
 
 vllm.distributed.parallel_state.GroupCoordinator = GroupCoordinatorPatch  # Note: check the GroupCoordinator with online serving
