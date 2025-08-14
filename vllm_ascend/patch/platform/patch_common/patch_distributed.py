@@ -17,9 +17,11 @@
 # Adapted from vllm/model_executor/models/qwen2_vl.py
 # This file is a part of the vllm-ascend project.
 
+import torch
 import vllm
 import vllm.envs as envs
-from torch.distributed import ProcessGroup
+from vllm.distributed.parallel_state import get_dp_group
+from torch.distributed import ProcessGroup, ReduceOp
 from vllm.config import ParallelConfig
 from vllm.distributed.utils import \
     stateless_init_torch_distributed_process_group
@@ -78,6 +80,21 @@ def stateless_init_dp_group(self) -> "ProcessGroup":
     return dp_group
 
 
+def ascend_has_unfinished_dp(dp_group: "ProcessGroup",
+                             has_unfinished: bool) -> bool:
+    tensor = torch.tensor([has_unfinished],
+                          dtype=torch.int32,
+                          device="npu")
+    # dp rank 0: has_unfinished_seqs=True
+    # dp rank 1: has_unfinished_seqs=False
+    # aggregated: has_unfinished_seqs=True
+    # so this is an OR operation, i.e. MAX in integers
+    get_dp_group.distributed.all_reduce(tensor, op=ReduceOp.MAX)
+    aggregated_has_unfinished = bool(tensor.item())
+    return aggregated_has_unfinished
+
+
 vllm.distributed.parallel_state.destroy_model_parallel = ascend_destroy_model_parallel
 ParallelConfig.get_next_dp_init_port = parallel_config_get_dp_port
 ParallelConfig.stateless_init_dp_group = stateless_init_dp_group
+ParallelConfig.has_unfinished_dp = ascend_has_unfinished_dp

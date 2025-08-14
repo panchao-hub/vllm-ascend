@@ -644,10 +644,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_across_dp[self.dp_size + self.dp_rank] = num_tokens
         forward_metadata = torch.tensor(num_tokens_across_dp +
                                         [with_prefill, not enable_dbo],
-                                        device="cpu",
+                                        device="npu",
                                         dtype=torch.int32)
-        dist.all_reduce(forward_metadata, group=get_dp_group().cpu_group)
-        with_prefill = bool(forward_metadata[-2])
+        get_dp_group().all_reduce(forward_metadata)
+        with_prefill = bool(forward_metadata[-2].cpu())
 
         # NOTE: when with_prefill is false before all_reduce and true after all_reduce, we need to revert pad.
         if with_prefill:
@@ -663,11 +663,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             maybe_padded_num_tokens = torch.max(num_tokens_across_dp).item()
             num_tokens_across_dp = torch.tensor([maybe_padded_num_tokens] *
                                                 self.dp_size,
-                                                device="cpu",
+                                                device="npu",
                                                 dtype=torch.int32)
+        num_tokens_across_dp = num_tokens_across_dp.cpu()
 
         return maybe_padded_num_tokens, num_tokens_across_dp, with_prefill, not bool(
-            forward_metadata[-1])
+            forward_metadata[-1].cpu())
 
     def _check_dbo_is_valid(self, query_lens: torch.Tensor,
                             attn_state: AscendAttentionState,
