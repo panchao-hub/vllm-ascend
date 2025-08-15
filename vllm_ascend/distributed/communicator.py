@@ -76,5 +76,5 @@ class NPUCommunicator(DeviceCommunicatorBase):
         return output_tensor
 
     def all_reduce(self, input_: torch.Tensor, op: ReduceOp = ReduceOp.SUM) -> torch.Tensor:
-        dist.all_reduce(input_, op=op, group=self.group)
+        dist.all_reduce(input_, op=op, group=self.device_group)
         return input_
