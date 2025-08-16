@@ -89,7 +89,7 @@ def ascend_has_unfinished_dp(dp_group: "ProcessGroup",
     # dp rank 1: has_unfinished_seqs=False
     # aggregated: has_unfinished_seqs=True
     # so this is an OR operation, i.e. MAX in integers
-    get_dp_group.distributed.all_reduce(tensor, op=ReduceOp.MAX)
+    get_dp_group().all_reduce(tensor, op=ReduceOp.MAX)
     aggregated_has_unfinished = bool(tensor.item())
     return aggregated_has_unfinished
 
