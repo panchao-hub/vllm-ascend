@@ -221,7 +221,10 @@ def fused_experts_with_mc2(
     )
 
     # TODO: Remove this in the future.
-    gate_up_out = torch.cat(gate_up_out_list, dim=0)
+    if len(gate_up_out_list) == 1:
+        gate_up_out = gate_up_out_list[0]
+    else:
+        gate_up_out = torch.cat(gate_up_out_list, dim=0)
     gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     w2 = w2.transpose(1, 2)
@@ -234,7 +237,10 @@ def fused_experts_with_mc2(
         group_list=group_list,
     )
 
-    down_out_list = torch.cat(down_out_list, dim=0)
+    if len(down_out_list) == 1:
+        down_out_list = down_out_list[0]
+    else:
+        down_out_list = torch.cat(down_out_list, dim=0)
 
     # moeCombine
     kwargs_mc2 = {
