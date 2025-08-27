@@ -378,8 +378,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value = value.view(-1, 1, self.num_kv_heads,
                            self.head_size).contiguous()
 
-        block_size = key_cache.shape[1]
-        slot_indices = slot_indices.view(-1, 1, 1).to(torch.int64)
+        block_size = torch.zeros((), device=slot_indices.device, dtype=torch.int32) + key_cache.shape[1]
+        slot_indices = slot_indices.view(-1, 1, 1)
         block_idx = torch.div(slot_indices, block_size, rounding_mode='floor')
         block_offset = slot_indices % block_size
         indices = torch.cat([block_idx, block_offset], dim=2)
@@ -447,7 +447,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                          value=value,
                                          key_cache=key_cache,
                                          value_cache=value_cache,
-                                         slot_indices=slots.to(torch.int64))
+                                         slot_indices=slots)
                 else:
                     torch_npu._npu_reshape_and_cache(
                         key=key[:num_actual_tokens],
