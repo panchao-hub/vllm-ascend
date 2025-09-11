@@ -178,7 +178,7 @@ class CustomQwen3Attention(Qwen3Attention):
                 attn_metadata.attn_state == AscendAttentionState.DecodeOnly):
             q, k = self.rotary_emb(positions, q, k, is_prefill=False)
             forward_kwargs = {}
-            if envs.VLLM_USE_V1:
+            if vllm_envs.VLLM_USE_V1:
                 output_shape = q.shape
                 output = torch.empty(output_shape,
                                      dtype=q.dtype,
