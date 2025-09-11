@@ -1,11 +1,13 @@
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+import vllm.envs as vllm_envs
 from transformers import Qwen3Config
+from vllm.attention import AttentionMetadata
 from vllm.attention import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -26,6 +28,8 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend import envs
 from vllm_ascend.ops.layernorm import AddRMSNormW8A8Quant
 
@@ -146,6 +150,8 @@ class CustomQwen3Attention(Qwen3Attention):
                 quant_config=quant_config,
                 prefix=f"{prefix}.o_proj",
             )
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
     def forward(
         self,
@@ -153,6 +159,8 @@ class CustomQwen3Attention(Qwen3Attention):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -165,13 +173,35 @@ class CustomQwen3Attention(Qwen3Attention):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions,
-                               q,
-                               k,
-                               cos=cos,
-                               sin=sin,
-                               is_cos_sin_cached=True)
-        attn_output = self.attn(q, k, v)
+
+        if (self.torchair_graph_enabled and attn_metadata is not None and
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly):
+            q, k = self.rotary_emb(positions, q, k, is_prefill=False)
+            forward_kwargs = {}
+            if envs.VLLM_USE_V1:
+                output_shape = q.shape
+                output = torch.empty(output_shape,
+                                     dtype=q.dtype,
+                                     device=q.device)
+                forward_kwargs['output'] = output
+
+            attn_output = self.attn.impl.forward(self.attn,
+                                                 q,
+                                                 k,
+                                                 v,
+                                                 kv_cache=kv_cache,
+                                                 attn_metadata=attn_metadata,
+                                                 trace_flag=False,
+                                                 **forward_kwargs)
+        else:
+            q, k = self.rotary_emb(positions,
+                                  q,
+                                  k,
+                                  cos=cos,
+                                  sin=sin,
+                                  is_cos_sin_cached=True)
+            attn_output = self.attn(q, k, v)
+
         pad_size = 0
         if self.enable_fc == 2:
             # pad input because AllGather requires token_num to be divisible by tp_size
@@ -288,6 +318,8 @@ class CustomQwen3DecoderLayer(nn.Module):
                 residual: Optional[torch.Tensor],
                 cos: torch.Tensor,
                 sin: torch.Tensor,
+                kv_cache: Optional[torch.Tensor] = None,
+                attn_metadata: Optional[AttentionMetadata] = None,
                 pad_size: int = 0) -> tuple[torch.Tensor, torch.Tensor, int]:
         # Self Attention
         if residual is None:
@@ -308,7 +340,9 @@ class CustomQwen3DecoderLayer(nn.Module):
         hidden_states, pad_size = self.self_attn(positions=positions,
                                                  hidden_states=hidden_states,
                                                  cos=cos,
-                                                 sin=sin)
+                                                 sin=sin,
+                                                 kv_cache=kv_cache,
+                                                 attn_metadata=attn_metadata)
 
         # Fully Connected
         if self.enable_fc == 2:
@@ -350,6 +384,8 @@ class CustomQwen3Model(Qwen2Model):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_caches: Optional[List[torch.Tensor]] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -374,9 +410,13 @@ class CustomQwen3Model(Qwen2Model):
             1, -1, 1, last_dim).contiguous()
 
         pad_size = 0
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        #for layer in self.layers[self.start_layer:self.end_layer]:
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             hidden_states, residual, pad_size = layer(positions, hidden_states,
                                                       residual, cos, sin,
+                                                      kv_caches[i - self.start_layer] if kv_caches is not None else None,
+                                                      attn_metadata,
                                                       pad_size)
 
         if not get_pp_group().is_last_rank:
@@ -446,10 +486,13 @@ class CustomQwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_caches: Optional[List[torch.Tensor]] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 
