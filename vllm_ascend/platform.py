@@ -389,3 +389,7 @@ class NPUPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def support_graph_mode(cls) -> bool:
+        return True
