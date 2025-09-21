@@ -1448,8 +1448,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         forward_context = get_forward_context()
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             graph_params = get_graph_params()
-            self.update_attn_params(graph_params, forward_context,
-                                    positions.shape[0])
+            if self.vllm_config.model_config.use_mla:
+                self.update_mla_attn_params(graph_params, forward_context,
+                                            positions.shape[0])
+            else:
+                self.update_attn_params(graph_params, forward_context,
+                                        positions.shape[0])
 
         if get_forward_context().flashcomm_v1_enabled:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
@@ -1494,6 +1498,58 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                                out=output)
                 torch.npu.graph_task_update_end(self.update_stream)
 
+                event.record(self.update_stream)
+
+    def update_mla_attn_params(self, graph_params, forward_context, runtime_shape):
+        # FIXME: Behold! We are using a temporary hack here to update the args
+        # for each layer's attention op in the graph.
+        for key, param, handle, event in zip(
+                forward_context.attn_metadata,
+                graph_params.attn_params[runtime_shape],
+                graph_params.handles[runtime_shape],
+                graph_params.events[runtime_shape],
+        ):
+            (
+                q_nope,
+                k_nope,
+                q_pe,
+                k_pe,
+                num_heads,
+                num_kv_heads,
+                input_layout,
+                spec_attn_mask,
+                sparse_mode,
+                scale,
+                block_table,
+                block_size,
+                seq_lens_list,
+                actual_seq_lengths,
+            ) = param
+            seq_lens_list = forward_context.attn_metadata[key].decode_metadata.seq_lens_list
+
+            with torch.npu.stream(self.update_stream):
+                torch.npu.graph_task_update_begin(self.update_stream, handle)
+
+                torch_npu.npu_fused_infer_attention_score.out(
+                    q_nope,
+                    k_nope,
+                    k_nope,
+                    query_rope=q_pe,
+                    key_rope=k_pe,
+                    num_heads=num_heads,
+                    num_key_value_heads=num_kv_heads,
+                    input_layout=input_layout,
+                    atten_mask=spec_attn_mask,
+                    sparse_mode=sparse_mode,
+                    scale=scale,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    block_table=block_table,
+                    block_size=block_size,
+                    actual_seq_lengths_kv=seq_lens_list,
+                    actual_seq_lengths=actual_seq_lengths)
+
+                torch.npu.graph_task_update_end(self.update_stream)
                 event.record(self.update_stream)
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,

@@ -20,8 +20,9 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
-from vllm_ascend.utils import npu_prefetch
+from vllm_ascend.utils import (npu_prefetch, get_graph_params)
 from vllm_ascend.worker.npu_input_batch import InputBatch
+from vllm.forward_context import ForwardContext, get_forward_context
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -275,7 +276,7 @@ class AscendMLAMetadataBuilder:
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
-        model: nn.Module,
+        model: Optional[nn.Module] = None,
     ) -> AscendMLAMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
@@ -292,11 +293,7 @@ class AscendMLAMetadataBuilder:
         device = self.device
 
         block_table = (common_attn_metadata.block_table_tensor[:num_reqs])
-        slot_mapping = common_attn_metadata.slot_mapping_cpu[:
-                                                             num_actual_tokens].to(
-                                                                 device,
-                                                                 non_blocking=
-                                                                 True)
+        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         input_positions = common_attn_metadata.positions[:
                                                          num_actual_tokens].long(
                                                          )
@@ -425,6 +422,24 @@ class AscendMLAMetadataBuilder:
             seq_lens=seq_lens,
             enable_dbo_across_dp=common_attn_metadata.enable_dbo_across_dp,
         )
+
+    def build_for_graph_capture(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
+    ):
+        if attn_state == AscendAttentionState.DecodeOnly:
+            attn_metadata = self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+            )
+        else:
+            raise NotImplementedError(
+                "Currently we only support building dummy metadata for DecodeOnly state"
+            )
+
+        attn_metadata.attn_state = attn_state
+        return attn_metadata
 
 
 class DecodeMLAPreprocessResult(NamedTuple):
@@ -829,24 +844,73 @@ class AscendMLAImpl(MLAAttentionImpl):
             sparse_mode = 0
             spec_attn_mask = None
 
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            q_nope,
-            k_nope,
-            k_nope,
-            query_rope=q_pe,
-            key_rope=k_pe,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout=input_layout,
-            atten_mask=spec_attn_mask,
-            sparse_mode=sparse_mode,
-            scale=self.scale,
-            antiquant_mode=0,
-            antiquant_scale=None,
-            block_table=decode_meta.block_table,
-            block_size=block_size,
-            actual_seq_lengths_kv=decode_meta.seq_lens_list,
-            actual_seq_lengths=actual_seq_lengths)
+        graph_params = get_graph_params()
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.capturing:
+            stream = torch_npu.npu.current_stream()
+
+            event = torch.npu.ExternalEvent()
+            event.wait(stream)
+            event.reset(stream)
+            graph_params.events[num_tokens].append(event)
+
+            graph_params.attn_params[num_tokens].append((
+                q_nope,
+                k_nope,
+                q_pe,
+                k_pe,
+                self.num_heads,
+                self.num_kv_heads,
+                input_layout,
+                spec_attn_mask,
+                sparse_mode,
+                self.scale,
+                decode_meta.block_table,
+                block_size,
+                decode_meta.seq_lens_list,
+                actual_seq_lengths
+            ))
+
+            torch.npu.graph_task_group_begin(stream)
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope,
+                k_nope,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout=input_layout,
+                atten_mask=spec_attn_mask,
+                sparse_mode=sparse_mode,
+                scale=self.scale,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                block_table=decode_meta.block_table,
+                block_size=block_size,
+                actual_seq_lengths_kv=decode_meta.seq_lens_list,
+                actual_seq_lengths=actual_seq_lengths)
+            handle = torch.npu.graph_task_group_end(stream)
+            graph_params.handles[num_tokens].append(handle)
+        else:
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                q_nope,
+                k_nope,
+                k_nope,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout=input_layout,
+                atten_mask=spec_attn_mask,
+                sparse_mode=sparse_mode,
+                scale=self.scale,
+                antiquant_mode=0,
+                antiquant_scale=None,
+                block_table=decode_meta.block_table,
+                block_size=block_size,
+                actual_seq_lengths_kv=decode_meta.seq_lens_list,
+                actual_seq_lengths=actual_seq_lengths)
 
         current_ms_metadata = get_multistream_comm_context()
         if current_ms_metadata is None:
