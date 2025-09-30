@@ -150,7 +150,9 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                with torch.npu.graph(aclgraph,
+                                     pool=self.graph_pool,
+                                     auto_dispatch_capture=True):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
                     if self.aclgraph_options.weak_ref_output:
@@ -187,6 +189,22 @@ class ACLGraphWrapper:
         logger.info_once("Replaying aclgraph")
         entry.aclgraph.replay()
         return entry.output
+
+    def update_inputs(self, forward_context, runtime_shape):
+        bd = getattr(forward_context, "batch_descriptor", None)
+        entry = self.concrete_aclgraph_entries.get(bd)
+        if entry is None or entry.aclgraph is None:
+            logger.info_once("No aclgraph to update for batch_descriptor=%s",
+                             bd)
+            return
+        graph = entry.aclgraph
+
+        for key in forward_context.attn_metadata:
+            seq_lens = forward_context.attn_metadata[key].decode.seq_lens_list
+            seq_lens = seq_lens + [0] * (runtime_shape - len(seq_lens))
+            graph.update(cpu_update_input=[{
+                "actual_seq_lengths_kv": seq_lens
+            }])
 
 
 def update_attn_params(update_stream, forward_context, runtime_shape):

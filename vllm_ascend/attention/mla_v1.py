@@ -22,7 +22,6 @@ from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          maybe_save_kv_layer_to_connector,
                                          split_decodes_and_prefills,
                                          wait_for_kv_layer_from_connector)
-from vllm_ascend.compilation.acl_graph import get_graph_params
 from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
@@ -896,35 +895,16 @@ class AscendMLAImpl(MLAAttentionImpl):
             "actual_seq_lengths": actual_seq_lengths,
             "actual_seq_lengths_kv": decode_meta.seq_lens_list,
         }
-        graph_params = get_graph_params()
         forward_context: ForwardContext = get_forward_context()
         if forward_context.capturing:
-            stream = torch_npu.npu.current_stream()
-
-            event = torch.npu.ExternalEvent()
-            event.wait(stream)
-            event.reset(stream)
-            graph_params.events[num_tokens].append(event)
-
-            workspace = graph_params.workspaces.get(num_tokens)
-            if workspace is None:
-                workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                    q_nope, k_nope, k_nope, **common_kwargs)
-                graph_params.workspaces[num_tokens] = workspace
+            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                q_nope, k_nope, k_nope, **common_kwargs)
 
             attn_output = torch.empty_like(q_nope)
             softmax_lse = torch.empty(num_tokens,
                                       dtype=q_nope.dtype,
                                       device=q_nope.device)
 
-            graph_params.attn_params[num_tokens].append(
-                (q_nope, k_nope, q_pe, k_pe, self.num_heads, self.num_kv_heads,
-                 input_layout, spec_attn_mask, sparse_mode, self.scale,
-                 decode_meta.block_table, block_size,
-                 decode_meta.seq_lens_list, actual_seq_lengths, workspace,
-                 attn_output, softmax_lse))
-
-            torch.npu.graph_task_group_begin(stream)
             torch_npu.npu_fused_infer_attention_score.out(
                 q_nope,
                 k_nope,
@@ -932,8 +912,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                 **common_kwargs,
                 workspace=workspace,
                 out=[attn_output, softmax_lse])
-            handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
         else:
             attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                 q_nope, k_nope, k_nope, **common_kwargs)

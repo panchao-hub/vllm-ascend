@@ -101,8 +101,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import (ACLGraphWrapper,
                                                set_graph_params,
-                                               update_attn_params,
-                                               update_mla_attn_params)
+                                               update_attn_params)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import \
     D2DExpertWeightLoader
@@ -1596,8 +1595,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             if self.vllm_config.model_config.use_mla:
                 # FIXME: Try using `auto_dispatch_capture=True`
-                update_mla_attn_params(self.update_stream, forward_context,
-                                       positions.shape[0])
+                # update_mla_attn_params(self.update_stream, forward_context,
+                #                        positions.shape[0])
+                self.model.update_inputs(forward_context, positions.shape[0])
             else:
                 update_attn_params(self.update_stream, forward_context,
                                    positions.shape[0])
