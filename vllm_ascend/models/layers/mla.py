@@ -137,10 +137,31 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttention):
         output = torch.empty(output_shape,
                              dtype=hidden_states.dtype,
                              device=hidden_states.device)
-        torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output,
-                                   self.prefix)
+        # torch.ops.vllm.mla_forward(hidden_states, need_gather_q_kv, output,
+        #                            self.prefix)
+        mla_forward_custom(hidden_states, need_gather_q_kv, output,
+                           self.prefix)
         output = output.view(-1, output_shape[-1])
         return output
+
+
+def mla_forward_custom(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    if forward_context.attn_metadata:
+        attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
+    else:
+        attn_metadata = forward_context.attn_metadata
+    kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]
+    self.mla_attn.impl.forward(self.mla_attn.layer_name, hidden_states,
+                               kv_cache, attn_metadata, need_gather_q_kv,
+                               output)
+    return
 
 
 def mla_forward(

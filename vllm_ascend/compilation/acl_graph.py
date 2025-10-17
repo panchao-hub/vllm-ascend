@@ -199,12 +199,11 @@ class ACLGraphWrapper:
             return
         graph = entry.aclgraph
 
-        for key in forward_context.attn_metadata:
-            seq_lens = forward_context.attn_metadata[key].decode.seq_lens_list
-            seq_lens = seq_lens + [0] * (runtime_shape - len(seq_lens))
-            graph.update(cpu_update_input=[{
-                "actual_seq_lengths_kv": seq_lens
-            }])
+        first_key = next(iter(forward_context.attn_metadata))
+        seq_lens = forward_context.attn_metadata[
+            first_key].decode.seq_lens_list
+        seq_lens = seq_lens + [0] * (runtime_shape - len(seq_lens))
+        graph.update(cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}])
 
 
 def update_attn_params(update_stream, forward_context, runtime_shape):
