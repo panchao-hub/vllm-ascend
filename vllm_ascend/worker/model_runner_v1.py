@@ -87,6 +87,7 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.utils import ProfileExecuteDuration
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
+from vllm_ascend.worker.sam import SAMProposer
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -228,7 +229,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                              diagonal=1).to("npu")
             if get_pp_group().is_last_rank:
                 if self.speculative_config.method == "ngram":
-                    self.drafter = NgramProposer(self.vllm_config)
+                    # self.drafter = NgramProposer(self.vllm_config)
+                    self.drafter = SAMProposer(self.vllm_config)
                 elif self.speculative_config.method == "eagle":
                     self.drafter = EagleProposer(self.vllm_config,
                                                  self.device)  # type: ignore
@@ -709,6 +711,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         elif attn_state == AscendAttentionState.PrefillCacheHit:
             return self.attn_mask_builder.get_attn_mask(
                 128, self.dtype, self.device)
+        # Speculative decoding: same as chunked prefilling
+        elif atten_state == AscendAttentionState.SpecDecoding:
+            return self.attn_mask_builder.get_splitfuse_attn_mask(
+                seq_lens, position, self.dtype, self.device)
         # Decode-only situation.
         else:
             return None
@@ -1356,9 +1362,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Speculative decoding is not enabled.
             spec_token_ids = None
         elif self.speculative_config.method == "ngram":
-            assert isinstance(self.drafter, NgramProposer)
-            spec_token_ids = self._generate_draft_token_ids(
-                valid_sampled_token_ids, sampling_metadata)
+        #     assert isinstance(self.drafter, NgramProposer)
+        #     spec_token_ids = self._generate_draft_token_ids(
+        #         valid_sampled_token_ids, sampling_metadata)
+        # elif self.speculative_config.method == "sam":
+            assert isinstance(self.drafter, SAMProposer)
+            spec_token_ids = self._generate_sam_token_ids(
+                valid_sampled_token_ids)
         elif self.speculative_config.method == "eagle":
             raise NotImplementedError(
                 "eagle method for spec decode doesn't work on vllm-ascend currently"
@@ -2168,6 +2178,38 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
             drafter_output = self.drafter.propose(
                 self.input_batch.token_ids_cpu[i, :end_idx])
+            if drafter_output is None or len(drafter_output) == 0:
+                draft_token_ids.append([])
+            else:
+                draft_token_ids.append(drafter_output.tolist())
+        return draft_token_ids
+
+    def _generate_sam_token_ids(self, sampled_token_ids):
+        draft_token_ids: = []
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+            if not num_sampled_ids:
+                # Skip speculative decoding.
+                draft_token_ids.append([])
+                continue
+        
+            # Skip requests that require top-p, top-k, etc.
+            req_id = self.input_batch.req_ids[i]
+            if not is_spec_decode_supported(req_id, self.input_batch):
+                draft_token_ids.append([])
+                continue
+            
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + num_sampled_ids
+            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+
+            drafter_output = self.drafter.propose(
+                req_id,
+                self.input_batch.token_ids_cpu[i, :start_idx],
+                self.input_batch.token_ids_cpu[i, start_idx:end_idx],
+                num_sampled_ids)
+
             if drafter_output is None or len(drafter_output) == 0:
                 draft_token_ids.append([])
             else:

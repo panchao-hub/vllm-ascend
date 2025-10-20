@@ -330,7 +330,7 @@ def rejection_greedy_sample_pytorch(
             output_token_ids[req_idx, num_draft_tokens] = bonus_token_id
 
 
-def rejection_random_sample_pytorch(
+def _rejection_random_sample_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
@@ -383,6 +383,115 @@ def rejection_random_sample_pytorch(
         if not rejected:
             bonus_token_id = bonus_token_ids[req_idx].item()
             output_token_ids[req_idx, num_draft_tokens] = bonus_token_id
+
+
+def rejection_random_sample_pytorch(
+    output_token_ids,  # [batch_size, max_spec_len + 1]
+    cu_num_draft_tokens,  # [batch_size]
+    draft_token_ids,  # [num_tokens]
+    draft_probs,  # [num_tokens, vocab_size] or None
+    target_probs,  # [num_tokens, vocab_size]
+    bonus_token_ids,  # [batch_size]
+    recovered_token_ids,  # [num_tokens]
+    uniform_probs,  # [num_tokens]
+    is_greedy,  # [batch_size]
+    max_spec_len,
+    vocab_size,
+    IS_NGRAM=False,
+):
+    batch_size = output_token_ids.shape[0]
+    device = output_token_ids.device
+
+    zero_cpu = torch.tensor([0], pin_memory=True)
+    zero_device = zero_cpu.to(device, non_blocking=True)
+
+    cu_start = torch.cat([zero_device, cu_num_draft_tokens[:-1]])
+    cu_end = cu_num_draft_tokens
+    num_draft_per_batch = cu_end - cu_start
+
+    max_draft_len = max_spec_len
+    pos_indices_cpu = torch.arange(max_draft_len, pin_memory=True)
+    pos_indices = pos_indices_cpu.to(device, non_blocking=True)[None, :]
+
+    valid_mask = pos_indices < num_draft_per_batch[:, None]
+    global_token_indices = cu_start[:, None] + pos_indices
+    global_token_indices = global_token_indices.clamp(0, draft_token_ids.shape[0]-1)
+    draft_tokens = draft_token_ids[global_token_indices]
+
+    flat_indices = global_token_indices.flatten()
+    flat_draft_tokens = draft_tokens.flatten()
+
+    if IS_NGRAM:
+        ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
+        draft_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(draft_tokens)
+    else:
+        flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
+        draft_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
+
+    flat_target_probs = target_probs[flat_indices, flat_draft_tokens]
+    target_token_probs = flat_target_probs.view(batch_size, max_draft_len)
+
+    uniform_token_probs = uniform_probs[global_token_indices]
+    recovered_tokens = recovered_token_ids[global_token_indices]
+
+    zero_threshold_cpu = torch.tensor([0.0], pin_memory=True, dtype=torch.float32)
+    zero_threshold = zero_threshold_cpu.to(device, non_blocking=True)
+
+    acceptance_condition = (draft_token_probs > zero_threshold) & (
+        target_token_probs / draft_token_probs >= uniform_token_probs
+    )
+
+    first_rejection = (~acceptance_condition) & valid_mask
+    default_pos_cpu = torch.full([batch_size, 1], max_draft_len, pin_memory=True)
+    default_pos = default_pos_cpu.to(device, non_blocking=True)
+
+    first_reject_pos = torch.where(
+        first_rejection.any(dim=1, keepdim=True),
+        first_rejection.float().argmax(dim=1, keepdim=True),
+        default_pos
+    )
+    pos_mask = pos_indices >= first_reject_pos
+    should_skip = pos_mask & valid_mask
+
+    final_acceptance = acceptance_condition & (~should_skip)
+    non_greedy_mask = ~is_greedy
+    update_mask = non_greedy_mask[:, None] & valid_mask & (~should_skip)
+
+    first_reject_mask = (pos_indices == first_reject_pos) & valid_mask & non_greedy_mask[:, None]
+    final_update_mask = update_mask | first_reject_mask
+    final_tokens = torch.where(
+        first_reject_mask,
+        recovered_tokens,
+        torch.where(final_acceptance, draft_tokens, output_token_ids[:, :max_draft_len])
+    )
+
+    output_token_ids[:, :max_draft_len] = torch.where(
+        final_update_mask,
+        final_tokens,
+        output_token_ids[:, :max_draft_len]
+    )
+
+    no_rejection = first_reject_pos.squeeze(1) >= num_draft_per_batch
+    should_add_bonus = non_greedy_mask & no_rejection
+
+    bonus_positions = num_draft_per_batch
+    seq_len = output_token_ids.shape[1]
+    all_positions_cpu = torch.arange(seq_len, pin_memory=True)
+    all_positions = all_positions_cpu.to(device, non_blocking=True)[None, :]
+
+    batch_bonus_positions = bonus_positions[:, None]
+
+    max_spec_len_cpu = torch.tensor([max_spec_len], pin_memory=True)
+    max_spec_len_device = max_spec_len_cpu.to(device, non_blocking=True)
+
+    valid_bonus_pos = bonus_positions < (max_spec_len_device + 1)
+    final_bonus_mask = should_add_bonus & valid_bonus_pos
+
+    bonus_pos_match = (all_positions == batch_bonus_positions)
+    bonus_pos_mask = bonus_pos_match & final_bonus_mask[:, None]
+
+    bonus_values_expanded = bonus_token_ids.view(-1, 1).expand(-1, seq_len)
+    output_token_ids[:] = torch.where(bonus_pos_mask, bonus_values_expanded, output_token_ids)
 
 
 def expand_pytorch(
