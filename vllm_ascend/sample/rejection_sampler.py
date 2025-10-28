@@ -186,7 +186,7 @@ def rejection_sample(
     )
 
     # Rejection sampling for random sampling requests.
-    rejection_random_sample_pytorch(
+    rejection_random_sample_pytorch_v2(
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -274,7 +274,7 @@ def sample_recovered_tokens(
             q[i].exponential_(generator=generator)
 
     recovered_token_ids = torch.empty_like(draft_token_ids)
-    sample_recovered_tokens_pytorch(
+    sample_recovered_tokens_pytorch_v2(
         recovered_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -330,7 +330,7 @@ def rejection_greedy_sample_pytorch(
             output_token_ids[req_idx, num_draft_tokens] = bonus_token_id
 
 
-def _rejection_random_sample_pytorch(
+def rejection_random_sample_pytorch(
     output_token_ids,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
@@ -385,7 +385,156 @@ def _rejection_random_sample_pytorch(
             output_token_ids[req_idx, num_draft_tokens] = bonus_token_id
 
 
-def rejection_random_sample_pytorch(
+def expand_pytorch(
+    output_ptr,  # [num_tokens]
+    input_ptr,  # [batch_size]
+    cu_num_tokens_ptr,  # [batch_size]
+    replace_from,
+    replace_to,
+    MAX_NUM_TOKENS,
+):
+    batch_size = len(input_ptr)
+
+    for req_idx in range(batch_size):
+        start_idx = 0 if req_idx == 0 else cu_num_tokens_ptr[req_idx - 1]
+        end_idx = cu_num_tokens_ptr[req_idx]
+        num_tokens = end_idx - start_idx
+
+        src_val = input_ptr[req_idx]
+        src_val = replace_to if src_val == replace_from else src_val
+
+        offset = torch.arange(MAX_NUM_TOKENS, device=num_tokens.device)
+        mask = offset < num_tokens
+
+        output_slice = start_idx + offset[mask]
+        output_ptr[output_slice] = src_val
+
+
+def sample_recovered_tokens_pytorch(
+    output_token_ids,  # [num_tokens]
+    cu_num_draft_tokens,  # [batch_size]
+    draft_token_ids,  # [num_tokens]
+    draft_probs,  # [num_tokens, vocab_size] or None
+    target_probs,  # [num_tokens, vocab_size]
+    q,  # [batch_size, vocab_size]
+    vocab_size,
+    IS_NGRAM=False,
+):
+    batch_size = len(cu_num_draft_tokens)
+
+    for req_idx in range(batch_size):
+        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens[req_idx - 1]
+        end_idx = cu_num_draft_tokens[req_idx]
+        num_draft_tokens = end_idx - start_idx
+
+        for pos in range(num_draft_tokens):
+            token_idx = start_idx + pos
+
+            if IS_NGRAM:
+                draft_token_id = draft_token_ids[token_idx]
+                orig_prob = target_probs[token_idx, draft_token_id].item()
+                target_probs[token_idx, draft_token_id] = 0
+                prob = target_probs[token_idx].clone()
+            else:
+                draft_p = draft_probs[token_idx].clone()
+                target_p = target_probs[token_idx].clone()
+                prob = torch.maximum(target_p - draft_p,
+                                     torch.tensor(0.0, device=target_p.device))
+
+            q_values = torch.full((vocab_size, ),
+                                  float('-inf'),
+                                  device=q.device)
+            q_values[:vocab_size] = q[req_idx, :vocab_size]
+
+            recovered_id = torch.argmax(prob / q_values).item()
+            output_token_ids[token_idx] = recovered_id
+
+            if IS_NGRAM:
+                target_probs[token_idx, draft_token_id] = orig_prob
+
+
+def expand_batch_to_tokens_v2(
+    x: torch.Tensor,  # [batch_size]
+    cu_num_tokens: torch.Tensor,  # [batch_size]
+    num_tokens: int,
+    replace_from: int = 0,
+    replace_to: int = 0,
+) -> torch.Tensor:
+    """Expand [batch_size] tensor to [num_tokens] tensor based on the number of
+    tokens per batch in cu_num_tokens.
+
+    For example, if x = [a, b, c] and cu_num_tokens = [2, 5, 6], then
+    num_tokens = 6, and expanded_x = [a, a, b, b, b, c].
+
+    Args:
+        x: [batch_size] tensor to expand.
+        cu_num_tokens: [batch_size] tensor containing the cumulative number of
+            tokens per batch. Each element represents the total number of
+            tokens up to and including that batch.
+        num_tokens: Total number of tokens.
+        replace_from: int = 0
+            Value to be replaced if it is found in x.
+        replace_to: int = 0
+            Value to replace with when replace_from is found.
+    Returns:
+        expanded_x: [num_tokens] tensor.
+    """
+    batch_size = x.shape[0]
+    if batch_size == 0:
+        return x.new_empty(num_tokens)
+    
+    zero = torch.tensor([0], device=cu_num_tokens.device, dtype=cu_num_tokens.dtype)
+    cu_num_tokens_with_zero = torch.cat((zero, cu_num_tokens))
+    lengths = torch.diff((cu_num_tokens_with_zero))
+
+    src_vals = x
+    if replace_from != replace_to:
+        src_vals = torch.where(x == replace_from, replace_to, x)
+    
+    expanded_x = torch.repeat_interleave(src_vals, repeats=lengths, dim=0)
+    return expanded_x
+
+
+def sample_recovered_tokens_pytorch_v2(
+    output_token_ids,  # [num_tokens]
+    cu_num_draft_tokens,  # [batch_size]
+    draft_token_ids,  # [num_tokens]
+    draft_probs,  # [num_tokens, vocab_size] or None
+    target_probs,  # [num_tokens, vocab_size]
+    q,  # [batch_size, vocab_size]
+    vocab_size,
+    IS_NGRAM=False,
+):
+    device = target_probs.device
+
+    num_tokens = target_probs.shape[0]
+    batch_size = len(cu_num_draft_tokens)
+
+    if IS_NGRAM:
+        prob = target_probs.clone()
+        token_indices = torch.arange(num_tokens, device=device)
+        prob[token_indices, draft_token_ids] = 0.0
+    else:
+        prob = torch.relu(target_probs - draft_probs)
+    
+    index_device = cu_num_draft_tokens.device
+
+    num_draft_tokens_per_req = torch.diff(
+        cu_num_draft_tokens,
+        prepend=torch.tensor([0], device=index_device)
+    )
+
+    request_indices = torch.repeat_interleave(
+        torch.arange(batch_size, device=index_device),
+        num_draft_tokens_per_req
+    ).to(device)
+
+    q_values = q[request_indices]
+    recovered_ids = torch.argmax(prob / q_values, dim=1)
+
+    output_token_ids[:num_tokens] = recovered_ids
+
+def rejection_random_sample_pytorch_v2(
     output_token_ids,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
@@ -494,72 +643,4 @@ def rejection_random_sample_pytorch(
     output_token_ids[:] = torch.where(bonus_pos_mask, bonus_values_expanded, output_token_ids)
 
 
-def expand_pytorch(
-    output_ptr,  # [num_tokens]
-    input_ptr,  # [batch_size]
-    cu_num_tokens_ptr,  # [batch_size]
-    replace_from,
-    replace_to,
-    MAX_NUM_TOKENS,
-):
-    batch_size = len(input_ptr)
-
-    for req_idx in range(batch_size):
-        start_idx = 0 if req_idx == 0 else cu_num_tokens_ptr[req_idx - 1]
-        end_idx = cu_num_tokens_ptr[req_idx]
-        num_tokens = end_idx - start_idx
-
-        src_val = input_ptr[req_idx]
-        src_val = replace_to if src_val == replace_from else src_val
-
-        offset = torch.arange(MAX_NUM_TOKENS, device=num_tokens.device)
-        mask = offset < num_tokens
-
-        output_slice = start_idx + offset[mask]
-        output_ptr[output_slice] = src_val
-
-
-def sample_recovered_tokens_pytorch(
-    output_token_ids,  # [num_tokens]
-    cu_num_draft_tokens,  # [batch_size]
-    draft_token_ids,  # [num_tokens]
-    draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, vocab_size]
-    q,  # [batch_size, vocab_size]
-    vocab_size,
-    IS_NGRAM=False,
-):
-    batch_size = len(cu_num_draft_tokens)
-
-    for req_idx in range(batch_size):
-        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens[req_idx - 1]
-        end_idx = cu_num_draft_tokens[req_idx]
-        num_draft_tokens = end_idx - start_idx
-
-        for pos in range(num_draft_tokens):
-            token_idx = start_idx + pos
-
-            if IS_NGRAM:
-                draft_token_id = draft_token_ids[token_idx]
-                orig_prob = target_probs[token_idx, draft_token_id].item()
-                target_probs[token_idx, draft_token_id] = 0
-                prob = target_probs[token_idx].clone()
-            else:
-                draft_p = draft_probs[token_idx].clone()
-                target_p = target_probs[token_idx].clone()
-                prob = torch.maximum(target_p - draft_p,
-                                     torch.tensor(0.0, device=target_p.device))
-
-            q_values = torch.full((vocab_size, ),
-                                  float('-inf'),
-                                  device=q.device)
-            q_values[:vocab_size] = q[req_idx, :vocab_size]
-
-            recovered_id = torch.argmax(prob / q_values).item()
-            output_token_ids[token_idx] = recovered_id
-
-            if IS_NGRAM:
-                target_probs[token_idx, draft_token_id] = orig_prob
-
-
-rs.expand_batch_to_tokens = expand_batch_to_tokens
+rs.expand_batch_to_tokens = expand_batch_to_tokens_v2
