@@ -221,6 +221,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.decode_token_per_req = 1
         self.speculative_auto_switch = (os.environ.get('VLLM_SPECULATIVE_AUTO_SWITCH', "0")=="1")
         self.speculative_auto_bs_thre = eval(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "32"))
+        self.speculative_auto_seqlen_thre = eval(os.environ.get('VLLM_SPECULATIVE_SEQ_LENGTH_THRE', "-1"))
         self.speculative_switch_on = False
         if self.speculative_config:
             self.use_spec_decode = True
@@ -2232,6 +2233,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
             end_idx = start_idx + num_sampled_ids
+            if self.speculative_auto_seqlen_thre > 0 and end_idx > self.speculative_auto_seqlen_thre:
+                draft_token_ids.append([])
+                continue
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
             drafter_output = self.drafter.propose(
