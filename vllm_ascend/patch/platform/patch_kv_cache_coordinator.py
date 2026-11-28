@@ -186,8 +186,11 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
-        # vLLM #53614 aligns exported Mamba checkpoints with EAGLE replay.
-        if use_eagle:
+        kv_transfer_config = getattr(kv_cache_config, "kv_transfer_config", None)
+        skips_eagle_block_drop = _skips_eagle_block_drop(kv_transfer_config)
+
+        # Keep the Mamba write boundary consistent with the role-specific EAGLE lookup policy.
+        if use_eagle and not skips_eagle_block_drop:
             for manager in self.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.drop_eagle_checkpoint_block = True
@@ -240,8 +243,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # is therefore never needed on the producer, and with hybrid
         # mamba-align pages (1536 tokens) it erases the whole shared prefix
         # of typical ~2K prompts, pinning P-side prefix hits to 0.
-        kv_transfer_config = getattr(kv_cache_config, "kv_transfer_config", None)
-        self.skips_eagle_block_drop = _skips_eagle_block_drop(kv_transfer_config)
+        self.skips_eagle_block_drop = skips_eagle_block_drop
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

@@ -1170,8 +1170,21 @@ def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
     if kv_transfer_config is None:
         return
     if getattr(kv_transfer_config, "kv_load_failure_policy", "fail") == "recompute":
-        if getattr(vllm_config.model_config, "is_hybrid", False):
+        if not getattr(vllm_config.model_config, "is_hybrid", False):
+            return
+        from vllm_ascend.ascend_config import is_kimi_c8_config
+        from vllm_ascend.core.kv_cache_interface import get_kv_connector_names, supports_c8_pd_connector
+
+        if not is_kimi_c8_config(vllm_config):
             raise AssertionError("Hybrid models do not support recompute mode kv load failure policy now.")
+        if not supports_c8_pd_connector(vllm_config) or "AscendStoreConnector" not in get_kv_connector_names(
+            kv_transfer_config
+        ):
+            raise AssertionError("C8 hybrid recompute requires producer-side Mooncake Store.")
+        children = kv_transfer_config.kv_connector_extra_config["connectors"]
+        store = next(child for child in children if child["kv_connector"] == "AscendStoreConnector")
+        if not (store.get("kv_connector_extra_config") or {}).get("load_async", False):
+            raise AssertionError("C8 hybrid recompute requires load_async=true on the Store connector.")
 
 
 def _update_compilation_modes(vllm_config: VllmConfig, ascend_config: AscendConfig) -> None:

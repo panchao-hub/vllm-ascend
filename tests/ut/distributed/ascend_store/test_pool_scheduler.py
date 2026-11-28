@@ -249,6 +249,22 @@ class TestGetZmqRpcPathLookup(unittest.TestCase):
 
 
 class TestKVPoolScheduler(unittest.TestCase):
+    def test_c8_dspark_only_resumes_at_a_verified_checkpoint(self):
+        config = self._make_config()
+        config.additional_config = {"mla_cache_mode": "C8"}
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        scheduler.use_hybrid = True
+        scheduler.use_eagle = True
+        scheduler.client = MagicMock()
+        # A checkpoint exists at 64, but neither 48 nor the divergent MLA
+        # boundary at 32 has a recurrent state in Store.
+        scheduler.client.lookup.side_effect = lambda length, *args, **kwargs: 64 if length >= 64 else 32
+        request = SimpleNamespace(prompt_token_ids=list(range(64)), num_tokens=64, request_id="r1", block_hashes=[])
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 32), (0, False))
+        self.assertNotIn("r1", scheduler.load_specs)
+        self.assertEqual(scheduler.client.lookup.call_args.args[0], 48)
+
     def _make_config(self, kv_role="kv_producer", extra_config=None, block_size=16):
         return make_config(kv_role, extra_config, block_size)
 
@@ -1048,6 +1064,20 @@ class TestKVPoolSchedulerUpdateConnectorOutput(unittest.TestCase):
         scheduler._block_pool = MagicMock()
         return scheduler
 
+    def test_c8_failed_async_load_allows_local_recompute(self):
+        scheduler = self._make_scheduler()
+        scheduler.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+        request = SimpleNamespace(prompt_token_ids=list(range(64)), num_tokens=64, request_id="r1", block_hashes=[])
+        scheduler.client = MagicMock()
+        scheduler.client.lookup.return_value = 48
+        scheduler._loading_req_ids.add("r1")
+        scheduler._unfinished_requests["r1"] = (request, [[3], [7]])
+
+        scheduler.update_connector_output(KVConnectorOutput(invalid_block_ids={7}, finished_recving={"r1"}))
+
+        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
+        scheduler.client.lookup.assert_not_called()
+
     def test_completed_event_frees_blocks(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
             AscendStoreKVConnectorWorkerMetadata,
@@ -1617,3 +1647,96 @@ def test_layerwise_partial_tail_preserves_zero_external_load(pool_hit_tokens):
     assert load_spec.vllm_cached_tokens == aligned_local_tokens
     assert load_spec.kvpool_cached_tokens == pool_hit_tokens
     assert load_spec.can_load
+
+
+def test_waiting_lookup_cache_deduplicates_and_invalidates(monkeypatch):
+    cfg = make_config(block_size=16, extra_config={"load_async": True})
+    cfg.additional_config = {"mla_cache_mode": "C8"}
+    scheduler = KVPoolScheduler(cfg, use_layerwise=False)
+    scheduler.client = MagicMock()
+    scheduler.client.lookup.return_value = 48
+    req_hit = SimpleNamespace(
+        request_id="blocked-hit",
+        prompt_token_ids=list(range(64)),
+        num_tokens=64,
+        block_hashes=[b"h"] * 4,
+    )
+    now = [100.0]
+    import vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler as pool_scheduler_mod
+
+    monkeypatch.setattr(pool_scheduler_mod.time, "monotonic", lambda: now[0])
+
+    # Repeated blocked-head probes reuse cached Store lookup result.
+    for _ in range(10):
+        assert scheduler.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert scheduler.client.lookup.call_count == 1
+    assert req_hit.request_id in scheduler.load_specs
+
+    # Local prefix growth forces a fresh lookup.
+    scheduler.client.lookup.return_value = 48
+    assert scheduler.get_num_new_matched_tokens(req_hit, 16) == (32, True)
+    assert scheduler.client.lookup.call_count == 2
+
+    # Admission via update_state_after_alloc invalidates the cache entry.
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = [[1, 2, 3]]
+    scheduler.update_state_after_alloc(req_hit, blocks, 32)
+    assert req_hit.request_id not in scheduler._waiting_lookup_cache
+
+    # Zero-hit waiting requests are invalidated when another request finishes
+    # (so newly persisted prefixes are picked up), while TTL also expires hits.
+    req_miss = SimpleNamespace(
+        request_id="blocked-miss",
+        prompt_token_ids=list(range(64)),
+        num_tokens=64,
+        block_hashes=[b"m"] * 4,
+    )
+    scheduler.client.lookup.return_value = 0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert scheduler.client.lookup.call_count == 3
+
+    finished_output = SimpleNamespace(
+        finished_req_ids={"other-done"},
+        preempted_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[]),
+        num_scheduled_tokens={},
+    )
+    scheduler.build_connector_meta(finished_output)
+    assert req_miss.request_id not in scheduler._waiting_lookup_cache
+
+    scheduler.client.lookup.return_value = 32
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (32, True)
+    assert scheduler.client.lookup.call_count == 4
+
+    # Advancing past TTL forces a fresh Store lookup.
+    now[0] += 10.0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (32, True)
+    assert scheduler.client.lookup.call_count == 5
+
+    # Completed Store PUT events immediately invalidate cached zero-hit entries.
+    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+        AscendStoreKVConnectorWorkerMetadata,
+    )
+
+    now[0] += 10.0
+    scheduler.client.lookup.return_value = 0
+    assert scheduler.get_num_new_matched_tokens(req_miss, 0) == (0, False)
+    assert req_miss.request_id in scheduler._waiting_lookup_cache
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            invalid_block_ids=set(),
+            finished_recving=None,
+            kv_connector_worker_meta=AscendStoreKVConnectorWorkerMetadata(completed_events={1: 1}),
+        )
+    )
+    assert req_miss.request_id not in scheduler._waiting_lookup_cache
+
+    # Non-C8 models do not use the waiting lookup cache.
+    non_c8 = KVPoolScheduler(make_config(block_size=16, extra_config={"load_async": True}), use_layerwise=False)
+    non_c8.client = MagicMock()
+    non_c8.client.lookup.return_value = 48
+    assert non_c8.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert non_c8.get_num_new_matched_tokens(req_hit, 0) == (48, True)
+    assert non_c8.client.lookup.call_count == 2

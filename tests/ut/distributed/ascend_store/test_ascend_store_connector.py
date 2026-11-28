@@ -66,6 +66,16 @@ class TestAscendStoreKVEvents(unittest.TestCase):
 
 
 class TestAscendStoreConnector(unittest.TestCase):
+    def test_divergent_hits_are_enabled_for_c8_bulk_mooncake_producers(self):
+        connector = AscendStoreConnector.__new__(AscendStoreConnector)
+        connector._vllm_config = types.SimpleNamespace(additional_config={"mla_cache_mode": "C8"})
+        connector.kv_role = "kv_producer"
+        connector.backend_name = "mooncake"
+        connector.use_layerwise = False
+        self.assertTrue(connector.supports_divergent_local_hybrid_hits)
+        connector.kv_role = "kv_consumer"
+        self.assertFalse(connector.supports_divergent_local_hybrid_hits)
+
     def test_bind_metadata_prepares_only_layerwise_workers(self):
         for use_layerwise in (False, True):
             with self.subTest(use_layerwise=use_layerwise):

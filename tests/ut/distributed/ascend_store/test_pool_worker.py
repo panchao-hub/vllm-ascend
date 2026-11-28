@@ -33,9 +33,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_conne
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import LayerBatchBuilder
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
+    KeyMetadata,
     LayerBlockRange,
     LayerTransferTask,
     LoadSpec,
+    PoolKey,
     ReqMeta,
     SharedBlockData,
     get_partial_block_index,
@@ -528,6 +530,56 @@ class TestKVPPPoolWorker(unittest.TestCase):
                 self.assertEqual(len(keys), 4)
                 self.assertTrue(all("@head_or_tp_rank:0" in key for key in keys[:2]))
                 self.assertTrue(all("@head_or_tp_rank:1" in key for key in keys[2:]))
+
+    def test_dcp8_aligned_state_lookup_uses_only_tp_owner_keys(self):
+        worker = make_worker(self, tp_size=8, dcp_size=8, use_mla=True)
+        worker.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+        worker.group_uses_align_state = [True]
+        model_name = worker.metadata[0].model_name
+        stored = {PoolKey(KeyMetadata(model_name, rank, rank, 0), "checkpoint").to_string() for rank in range(8)}
+        worker.m_store.exists.side_effect = lambda keys: [int(key in stored) for key in keys]
+
+        assert worker.lookup_scheduler(128, ["checkpoint"]) == 128
+        keys = worker.m_store.exists.call_args.args[0]
+        assert len(keys) == 8 and set(keys) == stored
+        stored.remove(keys[-1])
+        assert worker.lookup_scheduler(128, ["checkpoint"]) == 0
+
+    def test_sub_tp_dcp_c8_lookup_uses_real_tp_owner_and_dcp_shard_keys(self):
+        for dcp_size in (2, 4):
+            with self.subTest(dcp_size=dcp_size):
+                worker = make_worker(self, tp_size=8, dcp_size=dcp_size, use_mla=True)
+                worker.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+                model_name = worker.metadata[0].model_name
+                block_tokens = 16 * dcp_size
+
+                # Aligned KDA state group: 8 real (tp_rank % dcp_size, tp_rank) owner keys, zero ghost keys.
+                worker.group_uses_align_state = [True]
+                aligned_stored = {
+                    PoolKey(KeyMetadata(model_name, rank, rank % dcp_size, 0), "checkpoint").to_string()
+                    for rank in range(8)
+                }
+                worker.m_store.exists.side_effect = lambda keys, s=aligned_stored: [int(k in s) for k in keys]
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), block_tokens)
+                aligned_keys = worker.m_store.exists.call_args.args[0]
+                self.assertEqual(len(aligned_keys), 8)
+                self.assertEqual(set(aligned_keys), aligned_stored)
+                aligned_stored.remove(aligned_keys[-1])
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), 0)
+
+                # MLA group: exactly dcp_size shards with head_or_tp_rank=0.
+                worker.group_uses_align_state = [False]
+                mla_stored = {
+                    PoolKey(KeyMetadata(model_name, 0, dcp_rank, 0), "checkpoint").to_string()
+                    for dcp_rank in range(dcp_size)
+                }
+                worker.m_store.exists.side_effect = lambda keys, s=mla_stored: [int(k in s) for k in keys]
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), block_tokens)
+                mla_keys = worker.m_store.exists.call_args.args[0]
+                self.assertEqual(len(mla_keys), dcp_size)
+                self.assertEqual(set(mla_keys), mla_stored)
+                mla_stored.remove(mla_keys[-1])
+                self.assertEqual(worker.lookup_scheduler(block_tokens, ["checkpoint"]), 0)
 
 
 class _SparseSWAHitManager:
@@ -1232,6 +1284,45 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(stats.data["load_get_keys"], 1)
         self.assertEqual(len(stats.data["load_get_duration_seconds"]), 1)
 
+    def test_bulk_hybrid_load_failure_reports_block_and_skips_save(self):
+        for load_async in (False, True):
+            with self.subTest(load_async=load_async):
+                worker = self._make_worker(kv_role="kv_consumer", extra_config={"load_async": load_async})
+                worker.vllm_config.additional_config = {"mla_cache_mode": "C8"}
+                worker.grouped_block_size = [16, 16]
+                worker.group_uses_align_state = [False, True]
+                key = worker.token_database.metadata[0]
+                worker.token_database = type(worker.token_database)([key, key], [16, 16], None)
+                worker.token_database.set_group_buffers({0: [1000], 1: [2000]}, {0: [160], 1: [320]})
+                worker.m_store.get.return_value = [0, 1]
+                if load_async:
+                    with patch(
+                        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
+                        autospec=True,
+                        side_effect=lambda thread: thread.ready_event.set(),
+                    ):
+                        worker._start_kv_transfer_threads()
+
+                req = ReqMeta(
+                    req_id="r1",
+                    save_end_token=16,
+                    target_token_len=16,
+                    block_ids_by_group=[[7], [8]],
+                    kv_cache_group_ids=[0, 1],
+                    block_hashes=["h0"],
+                    load_spec=LoadSpec(0, 16, can_load=True, token_len=16),
+                    can_save=True,
+                )
+                meta = AscendConnectorMetadata(set())
+                meta.add_request(req)
+                worker.start_load_kv(meta)
+                if load_async:
+                    thread = worker.kv_recv_thread
+                    thread._handle_request(thread.request_queue.get_nowait())
+                self.assertEqual(worker.get_block_ids_with_load_errors(), {8})
+                if not load_async:
+                    self.assertFalse(req.can_save)
+
     @patch(
         "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVCacheStoreRecvingThread.start",
         autospec=True,
@@ -1333,10 +1424,14 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         )
         meta = AscendConnectorMetadata(set(), set())
         meta.add_request(req)
+        canceled = ReqMeta(req_id="r2", token_len_chunk=16, block_ids=[8], block_hashes=["h0"], can_save=False)
+        canceled.event_id = 7
+        meta.add_request(canceled)
         module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
         with patch(f"{module}.torch.npu", create=True):
             worker.wait_for_save(meta)
-        worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
+        worker.kv_send_thread.add_save_batch.assert_called_once_with([req, canceled])
+        self.assertIsNone(canceled.current_event)
         worker.kv_send_thread.request_queue.join.assert_not_called()
         self.assertIs(worker._previous_save_batch, save_batch)
 

@@ -406,6 +406,9 @@ class RlConfig:
         os.environ["VLLM_SERVER_DEV_MODE"] = "1"
 
 
+SUPPORTED_C8_DCP_SIZES = (1, 2, 4, 8)
+
+
 @config
 class AscendConfig:
     """Configuration Object for additional_config from vllm.configs.
@@ -700,18 +703,44 @@ class AscendConfig:
         if getattr(parallel, "prefill_context_parallel_size", 1) != 1:
             raise ValueError("mla_cache_mode=C8 currently requires prefill_context_parallel_size=1")
         dcp = getattr(parallel, "decode_context_parallel_size", 1)
-        if dcp not in (1, 8):
-            raise ValueError("mla_cache_mode=C8 currently supports decode_context_parallel_size=1 or 8")
-        if dcp == 8 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
-            raise ValueError("mla_cache_mode=C8 with DCP8 requires cp_kv_cache_interleave_size=1664")
+        if dcp not in SUPPORTED_C8_DCP_SIZES:
+            raise ValueError(
+                f"mla_cache_mode=C8 currently supports decode_context_parallel_size in {SUPPORTED_C8_DCP_SIZES}"
+            )
+        if dcp > 1 and getattr(parallel, "cp_kv_cache_interleave_size", None) != 1664:
+            raise ValueError(f"mla_cache_mode=C8 with DCP{dcp} requires cp_kv_cache_interleave_size=1664")
         kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
         if kv_transfer is not None:
-            if getattr(kv_transfer, "is_kv_producer", False) and dcp != 1:
-                raise ValueError("mla_cache_mode=C8 KV producer requires decode_context_parallel_size=1")
-            if kv_transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
-                raise ValueError("mla_cache_mode=C8 P/D requires MooncakeConnectorV2 or MooncakePullConnector")
-            if dcp == 8 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
-                raise ValueError("mla_cache_mode=C8 P/D with DCP8 requires block_size=1664")
+            from vllm_ascend.core.kv_cache_interface import supports_c8_pd_connector
+
+            if not supports_c8_pd_connector(vllm_config):
+                raise ValueError("mla_cache_mode=C8 P/D requires a supported Mooncake connector using V2/Pull")
+            if dcp > 1 and getattr(vllm_config.cache_config, "block_size", None) != 1664:
+                raise ValueError(f"mla_cache_mode=C8 P/D with DCP{dcp} requires block_size=1664")
+            if kv_transfer.kv_connector == "MultiConnector":
+                extra_config = kv_transfer.kv_connector_extra_config or {}
+                children = extra_config.get("connectors", ())
+                store_children = [
+                    child
+                    for child in children
+                    if isinstance(child, dict) and child.get("kv_connector") == "AscendStoreConnector"
+                ]
+                if store_children:
+                    if dcp > 1 and not vllm_config.cache_config.enable_prefix_caching:
+                        raise ValueError(f"C8 DCP{dcp} Store requires enable_prefix_caching for KDA checkpoint hashes")
+                    for child in store_children:
+                        store_config = child.get("kv_connector_extra_config") or {}
+                        for option in ("load_async", "consumer_is_to_load"):
+                            if option in extra_config and extra_config[option] != store_config.get(option, False):
+                                logger.warning(
+                                    "Ignoring MultiConnector-level %s=%r for C8 Store. Set it in "
+                                    "AscendStoreConnector.kv_connector_extra_config. Effective value: %r.",
+                                    option,
+                                    extra_config[option],
+                                    store_config.get(option, False),
+                                )
+                        if store_config.get("use_layerwise", False):
+                            raise ValueError("C8 Store first release supports bulk mode only")
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):

@@ -455,6 +455,40 @@ This bulk fast path uses physical-page-major object contents instead of the prev
     
 The `kv_connector_extra_config` fields used in the scripts above are documented in [kv-transfer-config Common Parameters](#kv-transfer-config-common-parameters).
 
+For C8 P/D with producer-side Store reuse, set per-connector options on the
+`AscendStoreConnector` child. The decoder uses `MooncakeConnectorV2` with
+`kv_role=kv_consumer` to pull KV directly from the producer.
+
+```json
+{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_producer",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_producer"},
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {"load_async": true}
+      }
+    ]
+  }
+}
+```
+
+C8 DCP8 producers using Store require local prefix caching enabled so the engine supplies a hash at each KDA checkpoint.
+Hybrid C8 supports `kv_load_failure_policy="recompute"` on the producer with
+`load_async=true` on its Store child. Use `"fail"` for synchronous loads and
+on the decoder. After upgrading the C8 DCP8 layout, warm the new namespace.
+Set a distinct Store `cache_salt` for each checkpoint, static KV calibration
+and TP layout when deployments share a pool.
+
+Check the producer's startup log for the effective Store namespace, DCP
+size and `load_async`. For a multi-prefix benchmark, report output token
+throughput and prefix hit rates alongside TTFT. Tune the prefill token
+budget and `long_prefill_token_threshold` against the aligned chunk size
+and available KV capacity for the benchmark.
+
 #### Step 5: MooncakeStore SSD Offload (Embedded Real Client Mode)
 
 In Mode A (Embedded Real Client), Mooncake is embedded in vLLM. When vLLM starts, `AscendStoreConnector`/`MooncakeBackend` automatically calls `MooncakeDistributedStore.setup()` using the settings in `mooncake.json`, with no separate `mooncake_client` process required.
@@ -487,6 +521,17 @@ export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1073741824   # 1 GB
 ```
 
+For C8 bulk Store with SSD offload, set the bucket options in the Prefill launch environment:
+
+```shell
+export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
+export MOONCAKE_OFFLOAD_ENABLE_EVICTION=true
+export MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS=true
+export MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true
+```
+
+Keep `protocol` set to `ascend` in `mooncake.json`. Use the per-rank quota settings above with values sized for the actual SSD. With SSD offload enabled, a bulk PUT retries each key rejected for insufficient capacity once. Allow DRAM headroom for pending offload writes.
+
 `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` risk: If not aligned to 1 GB (A3 + FabricMem scenario), it may cause `adxl MallocMem` failures or `FileStorage init` segfaults. Always set to a multiple of 1 GB.
 
 Note: `--max-num-batched-tokens` only chunks prefill compute; it does not reduce the memory required by `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`.
@@ -497,6 +542,10 @@ Note: `--max-num-batched-tokens` only chunks prefill compute; it does not reduce
 | `Parameter` | Type | Default | Required | Value Range | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | int (bytes) | 1342177280 (1280 MB) | No | Must align to 1 GB when A3 + `ASCEND_ENABLE_USE_FABRIC_MEM=1` | Per-rank SSD read/write buffer size (bytes). Not configurable in mooncake.json. Increase when `BUFFER_OVERFLOW` occurs. |
+| `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | str | Version dependent | For bucket storage | `bucket_storage_backend` | Selects bucket-based SSD storage. |
+| `MOONCAKE_OFFLOAD_ENABLE_EVICTION` | bool | Version dependent | No | true / false | Enables bucket eviction. |
+| `MOONCAKE_OFFLOAD_FLUSH_PARTIAL_BUCKETS` | bool | Version dependent | No | true / false | Allows partially filled buckets to reach disk. |
+| `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION` | bool | Version dependent | No | true / false | Enables disk watermark based eviction. |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | int (bytes) | 0 | No | Bytes; 0 means 90% of physical disk capacity | Eviction threshold (bytes). Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | str | none | No | none / fifo / lru | SSD eviction policy: `none` (writes fail when full), `fifo`, or `lru`. |
 | `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` | int (bytes) | 2199023255552 (2 TB) | Strongly recommended to set explicitly | Must match actual disk capacity | Per-rank maximum disk usage reported to Mooncake master, aggregated by master across clients (roughly 2 TB x rank count). Default far exceeds real disk capacity; must be overridden. |

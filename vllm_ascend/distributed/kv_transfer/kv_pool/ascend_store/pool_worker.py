@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import os
 import threading
@@ -29,7 +30,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.ascend_config import KVPPConfig
+from vllm_ascend.ascend_config import KVPPConfig, is_kimi_c8_config
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
@@ -89,11 +90,14 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_group_block_size,
     get_group_cache_family,
     get_partial_block_index,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
     infer_group_cache_families,
+    infer_store_group_block_sizes,
+    infer_store_hash_block_size,
     infer_tp_mismatch_info,
     is_kv_save_role,
     masked_block_runs,
@@ -237,6 +241,12 @@ class KVPoolWorker:
         self.use_layerwise_transfer = self.use_layerwise and self.layerwise_data_plane == "gva"
         validate_layerwise_topology(self.layerwise_protocol, vllm_config.parallel_config, self.use_layerwise)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        if is_kimi_c8_config(vllm_config) and self.dcp_size > 1:
+            assert self.dcp_rank == self.tp_rank % self.dcp_size, (
+                f"C8 DCP expects dcp_rank == tp_rank % dcp_size, got dcp_rank={self.dcp_rank}, "
+                f"tp_rank={self.tp_rank}, dcp_size={self.dcp_size}"
+            )
+        self.cache_namespace = infer_cache_namespace(kv_cache_groups, extra_config, dcp_size=self.dcp_size)
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
             self.use_block_key_layerwise and kv_cache_groups is not None and len(kv_cache_groups) > 1
         )
@@ -259,13 +269,8 @@ class KVPoolWorker:
             and len(cacheable_block_sizes) != len(self.original_block_size)
         ):
             raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
-        self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
-        if not isinstance(requested_hash_block_size, int):
-            requested_hash_block_size = None
-        self.hash_block_size = (
-            requested_hash_block_size if requested_hash_block_size is not None else min(cacheable_block_sizes)
-        ) * self.dcp_size
+        self.grouped_block_size = infer_store_group_block_sizes(vllm_config, kv_cache_groups, self.dcp_size)
+        self.hash_block_size = infer_store_hash_block_size(vllm_config, cacheable_block_sizes, self.dcp_size)
         for group_id in self.cacheable_group_ids:
             group_block_size = self.grouped_block_size[group_id]
             assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
@@ -292,6 +297,15 @@ class KVPoolWorker:
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
 
+        if is_kimi_c8_config(vllm_config):
+            logger.info(
+                "C8 AscendStore namespace=%s dcp_size=%d dcp_rank=%d load_async=%s group_block_sizes=%s",
+                self.cache_namespace,
+                self.dcp_size,
+                self.dcp_rank,
+                self.load_async,
+                self.grouped_block_size,
+            )
         logger.info(
             "use_hybrid: %s, use_mamba: %s, num_kv_cache_groups: %s, hash_block_size: %s, lcm_block_size: %s",
             self.use_hybrid,
@@ -430,6 +444,7 @@ class KVPoolWorker:
                     self.dcp_rank,
                     self.pp_rank,
                     group_id,
+                    namespace=self.cache_namespace,
                 )
             )
 
@@ -889,6 +904,7 @@ class KVPoolWorker:
                     self.group_uses_align_state,
                     self.enable_kv_events,
                     worker=self if self.tp_mismatch else None,
+                    save_live_checkpoint=is_kimi_c8_config(self.vllm_config),
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -906,6 +922,7 @@ class KVPoolWorker:
                     invalid_block_ids_lock=self._invalid_block_ids_lock,
                     worker=self if self.tp_mismatch else None,
                     record_operation=self._record_kv_connector_operation,
+                    report_hybrid_load_errors=is_kimi_c8_config(self.vllm_config),
                 )
                 self.kv_recv_thread.start()
                 ready_event.wait()
@@ -1385,6 +1402,7 @@ class KVPoolWorker:
             return
         self.current_layer = 0
         self.layerwise_retrievers = []
+        is_c8 = is_kimi_c8_config(self.vllm_config)
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             return
@@ -1506,36 +1524,13 @@ class KVPoolWorker:
             ):
                 self._record_failed_request(request)
                 continue
-            if ret is not None and any(r != 0 for r in ret):
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    ret,
-                )
-                if len(request.block_ids_by_group) == 1:
-                    self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        request.req_id,
-                        missing_block_ids,
-                    )
-            elif ret is None:
-                missing_block_ids = record_failed_blocks(
-                    block_id_list_c,
-                    [1] * len(block_id_list_c),
-                )
-                if len(request.block_ids_by_group) == 1:
-                    self._invalid_block_ids.update(missing_block_ids)
-                elif missing_block_ids:
-                    logger.error(
-                        "KV load failed for hybrid request %s. "
-                        "Skip invalid-block fallback to avoid scheduler crash. "
-                        "failed_blocks=%s",
-                        request.req_id,
-                        missing_block_ids,
-                    )
+            if ret is None or any(code != 0 for code in ret):
+                missing_block_ids = record_failed_blocks(block_id_list_c, ret)
+                if is_c8 or len(request.block_ids_by_group) == 1:
+                    if is_c8:
+                        request.can_save = False
+                    with self._invalid_block_ids_lock:
+                        self._invalid_block_ids.update(missing_block_ids)
             logger.debug(
                 "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
                 request.req_id,
@@ -3287,6 +3282,10 @@ class KVPoolWorker:
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
+                if request.event_id is not None:
+                    # The sender still completes the event so the scheduler
+                    # can release the pinned recurrent blocks.
+                    requests.append(request)
                 continue
             if current_event is None:
                 current_event = torch.npu.Event()
@@ -3739,7 +3738,7 @@ class KVPoolWorker:
                     hits.append(0)
                     continue
 
-                res = self.m_store.exists(keys)  # type: ignore[assignment]
+                res = require_aligned_batch_results("exists", keys, self.m_store.exists(keys))
 
                 if use_layerwise:
                     res = self.check_all_layers_exists(
@@ -3808,15 +3807,24 @@ class KVPoolWorker:
         # PCP replicas share keys; expand only the physical KV partitions.
         expanded: list[str] = []
         num_head_or_tp_ranks = self.get_group_tp_size(group_id)
+        if is_kimi_c8_config(self.vllm_config) and self.group_uses_align_state[group_id] and self.dcp_size > 1:
+            # Aligned state is keyed by its TP owner. With PCP1 that
+            # owner's DCP rank is fixed by its position in the TP group.
+            rank_pairs = [(rank % self.dcp_size, rank) for rank in range(num_head_or_tp_ranks)]
+        else:
+            rank_pairs = [
+                (dcp_rank, head_or_tp_rank)
+                for dcp_rank in range(self.dcp_size)
+                for head_or_tp_rank in range(num_head_or_tp_ranks)
+            ]
         # Keep each rank shard's block/layer keys contiguous to match
         # lookup_scheduler()'s [rank_shard][block] result slicing.
         for pp_rank in range(self.pp_size):
-            for dcp_rank in range(self.dcp_size):
-                for head_or_tp_rank in range(num_head_or_tp_ranks):
-                    for key in keys:
-                        rank_key = self._replace_key_field(key, "dcp", dcp_rank)
-                        rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
-                        expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
+            for dcp_rank, head_or_tp_rank in rank_pairs:
+                for key in keys:
+                    rank_key = self._replace_key_field(key, "dcp", dcp_rank)
+                    rank_key = self._replace_key_field(rank_key, "head_or_tp_rank", head_or_tp_rank)
+                    expanded.append(self._replace_key_field(rank_key, "pp_rank", pp_rank))
         return expanded
 
     def _expand_lookup_key_variants(self, key: str, group_id: int, include_all_ranks: bool) -> list[str]:
@@ -3864,7 +3872,21 @@ class KVPoolWorker:
                 variant_counts.append(len(variants))
 
             if keys:
-                res = self.m_store.exists(keys)  # type: ignore[assignment]
+                res = require_aligned_batch_results("exists", keys, self.m_store.exists(keys))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "KV pool exists group=%d hbm_hit_tokens=%d candidates=%d selected=%d "
+                        "all_ranks=%s first_key=%s first_shard_results=%s result_count=%d/%d",
+                        group_id,
+                        hbm_hit_tokens,
+                        len(group_block_hashes),
+                        len(chunk_hashes),
+                        include_all_ranks,
+                        keys[0],
+                        res[: variant_counts[0]],
+                        len(res),
+                        len(keys),
+                    )
                 offset = 0
                 for chunk_hash, count in zip(chunk_hashes, variant_counts, strict=True):
                     values = res[offset : offset + count]  # type: ignore[index]

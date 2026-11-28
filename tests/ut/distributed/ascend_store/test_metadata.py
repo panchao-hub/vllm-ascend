@@ -20,7 +20,10 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import torch
+
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
@@ -34,9 +37,12 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
+    infer_store_group_block_sizes,
+    infer_store_hash_block_size,
     masked_block_runs,
     uses_hybrid_kv_cache,
 )
@@ -814,3 +820,119 @@ class TestInferDcpMismatchInfo(unittest.TestCase):
 
     def test_invalid_peer_value_treated_as_local(self):
         self.assertFalse(infer_dcp_mismatch_info("kv_consumer", {"prefill_dcp_size": "bad"}, 2, 1))
+
+
+def test_c8_namespace_is_versioned_and_salted():
+    c8_spec = AscendMLAAttentionSpec(
+        block_size=1664,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        static_fp8_pa_nz=True,
+    )
+    group = SimpleNamespace(kv_cache_spec=c8_spec)
+    assert infer_cache_namespace([group], {"cache_salt": "release-20261121"}) == "c8-pa-nz-v1:release-20261121"
+    for dcp_size in (2, 4, 8):
+        assert (
+            infer_cache_namespace([group], {"cache_salt": "release-20261121"}, dcp_size=dcp_size)
+            == f"c8-pa-nz-v2-dcp{dcp_size}:release-20261121"
+        )
+
+
+def test_c8_namespace_reads_store_connector_salt():
+    c8_spec = AscendMLAAttentionSpec(
+        block_size=1664,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.float8_e4m3fn,
+        static_fp8_pa_nz=True,
+    )
+    group = SimpleNamespace(kv_cache_spec=c8_spec)
+    extra_config = {
+        "connectors": [
+            {"kv_connector": "MooncakeConnectorV2"},
+            {
+                "kv_connector": "AscendStoreConnector",
+                "kv_connector_extra_config": {"cache_salt": "release-20261121"},
+            },
+        ]
+    }
+
+    assert infer_cache_namespace([group], extra_config) == "c8-pa-nz-v1:release-20261121"
+
+
+def test_c8_store_dcp8_keys_use_end_of_logical_block():
+    config = SimpleNamespace(
+        additional_config={"mla_cache_mode": "C8"},
+        cache_config=SimpleNamespace(prefix_match_unit=None, enable_prefix_caching=True),
+    )
+    hash_size = infer_store_hash_block_size(config, [1664, 1664], 8)
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    config.cache_config.block_size = 1664
+    groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=1664)),
+        SimpleNamespace(kv_cache_spec=MambaSpec(block_size=1664, shapes=((4,),), dtypes=(torch.float32,))),
+    ]
+    sizes = infer_store_group_block_sizes(config, groups, 8)
+    assert sizes == [13312, 1664]
+    db = ChunkedTokenDatabase([KeyMetadata("model", 0, 0, 0)] * 2, sizes, None, hash_block_size=hash_size)
+    assert list(
+        db._iter_token_chunks(
+            13312,
+            list("abcdefgh"),
+            kv_cache_group_id=1,
+            block_ids=[0] * 7 + [2],
+            skip_null_blocks=True,
+        )
+    ) == [(11648, 13312, "h", 2)]
+    assert hash_size == 1664
+    hashes = [f"h{index}" for index in range(16)]
+    assert get_block_hashes(hashes, 1664 * 8, hash_size)[:] == ["h7", "h15"]
+
+
+def test_namespace_is_serialized_only_when_non_default():
+    meta = KeyMetadata("llama", 0, 0, 0, namespace="c8-pa-nz-v1:run")
+    assert "@namespace:c8-pa-nz-v1:run" in PoolKey(meta, "hash").to_string()
+
+
+def test_namespace_position_matches_chunked_token_prefix():
+    meta = KeyMetadata("llama", 0, 0, 0, namespace="v1:release")
+    key = PoolKey(meta, "hash")
+    database = ChunkedTokenDatabase([meta], [16], None)
+
+    assert key.to_string() == database._get_key_prefix(0) + "hash"
+
+
+def test_c8_store_sub_tp_dcp_keys_use_end_of_logical_block():
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    for dcp_size in (2, 4):
+        config = SimpleNamespace(
+            additional_config={"mla_cache_mode": "C8"},
+            cache_config=SimpleNamespace(prefix_match_unit=None, enable_prefix_caching=True, block_size=1664),
+        )
+        hash_size = infer_store_hash_block_size(config, [1664, 1664], dcp_size)
+        groups = [
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=1664)),
+            SimpleNamespace(kv_cache_spec=MambaSpec(block_size=1664, shapes=((4,),), dtypes=(torch.float32,))),
+        ]
+        sizes = infer_store_group_block_sizes(config, groups, dcp_size)
+        logical_block = 1664 * dcp_size
+        assert hash_size == 1664
+        assert sizes == [logical_block, 1664]
+        db = ChunkedTokenDatabase([KeyMetadata("model", 0, 0, 0)] * 2, sizes, None, hash_block_size=hash_size)
+        hashes = [f"h{index}" for index in range(2 * dcp_size)]
+        assert list(
+            db._iter_token_chunks(
+                logical_block,
+                hashes[:dcp_size],
+                kv_cache_group_id=1,
+                block_ids=[0] * (dcp_size - 1) + [2],
+                skip_null_blocks=True,
+            )
+        ) == [(logical_block - 1664, logical_block, f"h{dcp_size - 1}", 2)]
+        assert get_block_hashes(hashes, logical_block, hash_size)[:] == [
+            f"h{dcp_size - 1}",
+            f"h{2 * dcp_size - 1}",
+        ]

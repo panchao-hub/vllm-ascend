@@ -31,6 +31,8 @@ from vllm_ascend.distributed.parallel_state import get_global_rank
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 DEFAULT_TENANT_ID = "default"
+# Mooncake Store ErrorCode::NO_AVAILABLE_MEMORY / insufficient capacity during eviction.
+_PUT_INSUFFICIENT_SPACE = -200
 MOONCAKE_LAYERWISE_CLIENT_METHODS = (
     "batch_put_session_start",
     "batch_put_from_multi_buffer_ranges",
@@ -300,7 +302,7 @@ class MooncakeBackend(Backend):
                 "Mooncake SSD offload enabled (Mode A): path=%s",
                 self.config.ssd_offload_path,
             )
-        logger.info("Mooncake tenant_id=%s", self.config.tenant_id)
+        logger.info("Mooncake protocol=%s tenant_id=%s", self.config.protocol, self.config.tenant_id)
         return store
 
     @classmethod
@@ -434,13 +436,30 @@ class MooncakeBackend(Backend):
             raise RuntimeError("Mooncake client does not support batch_get_session_end")
         return int(method(keys))
 
-    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
+    def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> bool:
         self.ensure_initialized()
         assert self.store is not None
         try:
             config = self._build_replicate_config()
             _emit_whole_key_debug_event("put", len(keys))
-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            put = self.store.batch_put_from_multi_buffers
+            res = require_aligned_batch_results("batch_put_from_multi_buffers", keys, put(keys, addrs, sizes, config))
+            if self.config.enable_ssd_offload:
+                retry_indices = [i for i, code in enumerate(res) if code == _PUT_INSUFFICIENT_SPACE]
+                if retry_indices:
+                    retry_keys = [keys[i] for i in retry_indices]
+                    retry_res = require_aligned_batch_results(
+                        "batch_put_from_multi_buffers",
+                        retry_keys,
+                        put(
+                            retry_keys,
+                            [addrs[i] for i in retry_indices],
+                            [sizes[i] for i in retry_indices],
+                            config,
+                        ),
+                    )
+                    for i, code in zip(retry_indices, retry_res, strict=True):
+                        res[i] = code
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -454,6 +473,7 @@ class MooncakeBackend(Backend):
                 logger.debug("Failed to put key details. keys=%s, result=%s", keys, res)
                 if self._lazy_init:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+                return False
         except Exception as e:
             logger.error(
                 "Failed to put %d keys out of %d. type=%s, error=%s. Check store state and memory.",
@@ -465,6 +485,8 @@ class MooncakeBackend(Backend):
             logger.debug("Failed to put key details. keys=%s", keys)
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
+            return False
+        return True
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
@@ -485,7 +507,12 @@ class MooncakeBackend(Backend):
         try:
             _emit_whole_key_debug_event("get", len(keys))
             res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
-            res_list = list(res)
+            res_list = require_aligned_batch_results("batch_get_into_multi_buffers", keys, res)
+            # A successful GET returns the number of bytes copied for this key.
+            res_list = [
+                value if value < 0 else (0 if value == sum(parts) else -1)
+                for value, parts in zip(res_list, sizes, strict=True)
+            ]
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             error_codes = sorted(set(failed_codes))
@@ -497,9 +524,6 @@ class MooncakeBackend(Backend):
                     error_codes,
                 )
                 logger.debug("Failed to get key details. keys=%s, result=%s", keys, res_list)
-            for i, value in enumerate(res_list):
-                if value > 0:
-                    res_list[i] = 0
             return res_list
         except Exception as e:
             logger.error(

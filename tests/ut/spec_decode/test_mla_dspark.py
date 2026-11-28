@@ -29,6 +29,7 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpec
 def make_speculator():
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     spec._draft_mla_uses_device_lengths = False
+    spec.dp_size = 1
     spec.replicated_pcp = False
     spec.enable_adaptive_verification = False
     spec.attn_architecture = "MLA"
@@ -312,7 +313,7 @@ def test_propose_uses_draft_decode_flags_for_dcp(monkeypatch, use_dcp):
     spec.use_dcp = use_dcp
     spec.max_num_reqs = 4
     spec.max_num_tokens = 20
-    input_batch = SimpleNamespace(num_reqs=1, is_prefilling_np=np.array([True, True, True, True]))
+    input_batch = SimpleNamespace(has_prefill=False, num_reqs=1, is_prefilling_np=np.array([True, True, True, True]))
     captured: dict[str, Any] = {}
     prepared_lengths = torch.tensor([12, 0, 0, 0], dtype=torch.int32)
     prepared_flags = torch.zeros(4, dtype=torch.bool)
@@ -469,3 +470,139 @@ def test_query_builder_overrides_and_restores_target_context(monkeypatch, archit
     torch.testing.assert_close(captured[0]["positions"], torch.arange(10))
     assert captured[1]["is_prefilling"] is flags
     assert captured[1]["attn_state"] == AscendAttentionState.DecodeOnly
+
+
+def _make_intermediate_prefill_speculator() -> AscendDSparkSpeculator:
+    spec = make_speculator()
+    spec.dp_size = 1
+    spec.replicated_pcp = False
+    spec.enable_adaptive_verification = False
+    spec.pcp_manager = None
+    spec.draft_kv_cache_group_id = 0
+    spec.draft_kv_cache_group_ids = [0]
+    spec._layer_group_idx = [0, 0, 0]
+    spec.num_query_per_req = 4
+    spec.num_speculative_steps = 4
+    spec.max_num_reqs = 4
+    spec.max_num_tokens = 16
+    spec.max_model_len = 1048576
+    spec.parallel_drafting_token_id = 99
+    spec.sample_from_anchor = True
+    spec.hidden_states = torch.zeros((16, 4), dtype=torch.float32)
+    spec.context_positions = torch.zeros(16, dtype=torch.int64)
+    spec._context_slot_mappings = [torch.arange(100, 116, dtype=torch.int32)]
+    spec.sample_indices = torch.zeros(16, dtype=torch.int64)
+    spec.sample_pos = torch.zeros(16, dtype=torch.int64)
+    spec.sample_idx_mapping = torch.full((16,), -1, dtype=torch.int32)
+    spec.temperature = torch.ones(4, dtype=torch.float32)
+    spec.seeds = torch.zeros(4, dtype=torch.int64)
+    spec.draft_tokens = torch.full((4, 4), 7, dtype=torch.int32)
+    spec.block_tables = SimpleNamespace(
+        slot_mappings=[torch.zeros(16, dtype=torch.int32)],
+        input_block_tables=[torch.ones((4, 2), dtype=torch.int32)],
+        kernel_block_sizes=[128],
+        cp_rank=0,
+        cp_size=2,
+        cp_interleave=1664,
+    )
+    spec.model = SimpleNamespace(
+        combine_hidden_states=MagicMock(side_effect=lambda x: x[:, :4] + 1.0),
+        precompute_and_store_context_kv=MagicMock(),
+    )
+    return spec
+
+
+def test_propose_skips_draft_generation_on_pure_intermediate_prefill_chunk(monkeypatch):
+    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as upstream_dflash
+
+    spec = _make_intermediate_prefill_speculator()
+    prep_mock = MagicMock()
+    parent_propose = MagicMock(return_value="full_draft")
+    prepare_dcp = MagicMock()
+    monkeypatch.setattr(upstream_dflash, "prepare_dflash_inputs", prep_mock)
+    monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
+    monkeypatch.setattr(spec, "_prepare_draft_dcp_metadata_inputs", prepare_dcp)
+
+    batch = SimpleNamespace(
+        num_reqs=1,
+        num_tokens=6,
+        num_draft_tokens=0,
+        has_prefill=True,
+        is_prefilling_np=np.array([True], dtype=np.bool_),
+        num_computed_prefill_tokens_np=np.array([13312], dtype=np.int32),
+        num_scheduled_tokens=np.array([13312], dtype=np.int32),
+        prefill_len_np=np.array([350000], dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([26624], dtype=torch.int32),
+        idx_mapping=torch.tensor([0], dtype=torch.int64),
+    )
+    aux = [torch.full((6, 4), 2.0), torch.full((6, 4), 3.0)]
+    zeros_i32 = torch.zeros(1, dtype=torch.int32)
+    out = spec.propose(
+        batch,
+        attn_metadata={},
+        slot_mappings={},
+        last_hidden_states=torch.zeros((6, 4)),
+        aux_hidden_states=aux,
+        num_sampled=zeros_i32,
+        num_rejected=zeros_i32,
+        last_sampled=torch.zeros((4, 1), dtype=torch.int64),
+        next_prefill_tokens=torch.zeros(4, dtype=torch.int32),
+        temperature=torch.ones(4, dtype=torch.float32),
+        seeds=torch.zeros(4, dtype=torch.int64),
+    )
+
+    parent_propose.assert_not_called()
+    prepare_dcp.assert_not_called()
+    prep_mock.assert_called_once()
+    spec.model.combine_hidden_states.assert_called_once()
+    spec.model.precompute_and_store_context_kv.assert_called_once()
+    stored_states, stored_pos, stored_slots = spec.model.precompute_and_store_context_kv.call_args.args
+    torch.testing.assert_close(stored_states, torch.full((6, 4), 3.0))
+    assert stored_pos.shape == (6,)
+    assert len(stored_slots) == 3 and all(s.tolist() == list(range(100, 106)) for s in stored_slots)
+    assert out.shape == (1, 4) and int(out.abs().sum()) == 0
+    assert spec.draft_max_seq_len == 26628
+
+
+@pytest.mark.parametrize(
+    "computed,scheduled,prefill_len,extra_kwargs",
+    [
+        ([346112], [3888], [350000], {}),  # final prefill chunk
+        ([0, 346112], [13312, 3888], [350000, 350000], {}),  # mixed intermediate + final
+        ([13312], [13312], [350000], {"dummy_run": True}),
+        ([13312], [13312], [350000], {"is_profile": True}),
+        ([13312], [13312], [350000], {"dp_size": 2}),
+        ([13312], [13312], [350000], {"replicated_pcp": True}),
+    ],
+)
+def test_propose_runs_full_draft_when_sampling_or_sync_required(
+    monkeypatch, computed, scheduled, prefill_len, extra_kwargs
+):
+    spec = _make_intermediate_prefill_speculator()
+    if "dp_size" in extra_kwargs:
+        spec.dp_size = extra_kwargs.pop("dp_size")
+    if "replicated_pcp" in extra_kwargs:
+        spec.replicated_pcp = extra_kwargs.pop("replicated_pcp")
+    monkeypatch.setattr(shared, "build_attn_metadata_wrapper", nullcontext)
+    monkeypatch.setattr(shared, "build_attn_metadata_factory", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(
+        spec, "_prepare_draft_dcp_metadata_inputs", lambda *a, **k: (None, torch.zeros(4, dtype=torch.bool))
+    )
+    parent_propose = MagicMock(return_value="full_draft")
+    monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
+
+    num_reqs = len(computed)
+    batch = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_tokens=6,
+        num_draft_tokens=0,
+        has_prefill=True,
+        is_prefilling_np=np.ones(num_reqs, dtype=np.bool_),
+        num_computed_prefill_tokens_np=np.array(computed, dtype=np.int32),
+        num_scheduled_tokens=np.array(scheduled, dtype=np.int32),
+        prefill_len_np=np.array(prefill_len, dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor(computed, dtype=torch.int32),
+    )
+    res = spec.propose(batch, *[None for _ in range(10)], **extra_kwargs)
+    assert res == "full_draft"
+    parent_propose.assert_called_once()

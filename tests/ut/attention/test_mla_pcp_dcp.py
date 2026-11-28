@@ -603,3 +603,222 @@ def test_native_dcp_workspace_uses_draft_reader_geometry(c8, draft, block, expec
     nope, rope, indices = impl._allocate_dcp_current_kv_buffers(8, torch.device("cpu"))
     assert nope.shape[1] == rope.shape[1] == expected
     assert indices.tolist() == list(range(8))
+
+
+def test_reorg_kvcache_packed_single_span_zero_copy_and_multi_span_equivalence():
+    from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl, DCPChunkedContextMetadata
+
+    impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+    impl.kv_lora_rank = 4
+    impl.qk_rope_head_dim = 2
+
+    # Case 1: Single contiguous span across DCP=2 full chunk -> 0 torch.cat calls, zero-copy view!
+    packed_local = torch.arange(6 * 6, dtype=torch.float32).reshape(6, 1, 6)
+    gathered = torch.arange(12 * 6, dtype=torch.float32).reshape(12, 1, 6)
+    impl._dcp_all_gather = Mock(return_value=gathered)
+    meta_full = DCPChunkedContextMetadata(
+        cu_seq_lens=torch.tensor([0, 12]),
+        starts=torch.tensor([[0]]),
+        seq_tot=[6],
+        max_seq_lens=[12],
+        workspace=torch.empty(0),
+        chunk_seq_lens=torch.tensor([[12]]),
+        chunk_seq_lens_npu=torch.tensor([[12]]),
+        chunk_actual_seq_lengths_kv_list=[[12]],
+        padded_local_chunk_seq_lens=[[6]],
+        local_context_lens_allranks=[[6, 6]],
+        cu_seq_lens_lst=[[0, 12]],
+        chunk_size=6,
+        kv_rank_offsets=[[0, 6]],
+    )
+    with patch("vllm_ascend.attention.context_parallel.mla_cp.torch.cat", wraps=torch.cat) as cat_spy:
+        out_packed = impl._reorg_packed_kvcache(
+            packed_local,
+            chunked_context=meta_full,
+            chunk_idx=0,
+            toks=6,
+        )
+    assert cat_spy.call_count == 0
+    impl._dcp_all_gather.assert_called_once()
+    assert impl._dcp_all_gather.call_args.args[0].data_ptr() == packed_local.data_ptr()
+    assert out_packed.data_ptr() == gathered.data_ptr()
+    torch.testing.assert_close(out_packed, gathered)
+
+    # Case 2: Padded tail chunk (rank 0 has 6, rank 1 has 4 out of 6) -> 1 cat instead of 3, exact match!
+    meta_tail = DCPChunkedContextMetadata(
+        cu_seq_lens=torch.tensor([0, 5, 10]),
+        starts=torch.tensor([[0, 0]]),
+        seq_tot=[6],
+        max_seq_lens=[5],
+        workspace=torch.empty(0),
+        chunk_seq_lens=torch.tensor([[5, 5]]),
+        chunk_seq_lens_npu=torch.tensor([[5, 5]]),
+        chunk_actual_seq_lengths_kv_list=[[5, 10]],
+        padded_local_chunk_seq_lens=[[3, 3]],
+        local_context_lens_allranks=[[3, 2], [2, 3]],
+        cu_seq_lens_lst=[[0, 5, 10]],
+        chunk_size=3,
+        kv_rank_offsets=[[0, 6]],
+    )
+    impl._dcp_all_gather = Mock(return_value=gathered)
+    with patch("vllm_ascend.attention.context_parallel.mla_cp.torch.cat", wraps=torch.cat) as cat_spy2:
+        tail_packed = impl._reorg_packed_kvcache(
+            packed_local,
+            chunked_context=meta_tail,
+            chunk_idx=0,
+            toks=6,
+        )
+    assert cat_spy2.call_count == 1
+    expected_rows = torch.cat([gathered[0:3], gathered[6:8], gathered[3:5], gathered[9:12]], dim=0)
+    torch.testing.assert_close(tail_packed, expected_rows)
+
+
+def test_c8_compute_prefill_context_allgathers_uint8_before_dequant():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from vllm_ascend.attention import mla_v1
+    from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPImpl, DCPChunkedContextMetadata
+    from vllm_ascend.attention.kimi_c8_static import (
+        C8PrefillHistory,
+        _dequantize_static_fp8,
+        pa_nz_cache_view,
+        write_static_fp8_cache,
+    )
+
+    torch.manual_seed(23)
+    num_blocks, block_size = 4, 128
+    backing_r0 = torch.zeros(num_blocks * block_size * 576, dtype=torch.uint8)
+    backing_r1 = torch.zeros(num_blocks * block_size * 576, dtype=torch.uint8)
+    cache_r0 = pa_nz_cache_view(backing_r0, num_blocks, block_size)
+    cache_r1 = pa_nz_cache_view(backing_r1, num_blocks, block_size)
+    scale = torch.tensor([0.1372941], dtype=torch.float32)
+    write_static_fp8_cache(
+        torch.randn(num_blocks * block_size, 576, dtype=torch.bfloat16),
+        cache_r0,
+        torch.arange(num_blocks * block_size, dtype=torch.int64),
+        scale,
+    )
+    write_static_fp8_cache(
+        torch.randn(num_blocks * block_size, 576, dtype=torch.bfloat16),
+        cache_r1,
+        torch.arange(num_blocks * block_size, dtype=torch.int64),
+        scale,
+    )
+
+    # 2 chunks: chunk 0 is a full aligned block per rank (single span, zero cat);
+    # chunk 1 is a padded tail chunk (rank 0 has 128, rank 1 has 80 valid out of 128).
+    table = torch.tensor([[0, 1]], dtype=torch.int32)
+    chunked = DCPChunkedContextMetadata(
+        cu_seq_lens=torch.tensor([0, 256]),
+        starts=torch.tensor([[0], [128]], dtype=torch.int32),
+        seq_tot=[128, 128],
+        max_seq_lens=[256, 208],
+        workspace=torch.empty(0),
+        chunk_seq_lens=torch.tensor([[256], [208]]),
+        chunk_seq_lens_npu=torch.tensor([[256], [208]]),
+        chunk_actual_seq_lengths_kv_list=[[256], [208]],
+        padded_local_chunk_seq_lens=[[128], [128]],
+        local_context_lens_allranks=[[256, 208]],
+        cu_seq_lens_lst=[[0, 256], [0, 208]],
+        chunk_size=128,
+        kv_rank_offsets=[[0, 128], [0, 128]],
+    )
+    meta = SimpleNamespace(
+        prefill=SimpleNamespace(
+            chunked_context=chunked,
+            actual_seq_lengths_q=[4],
+            c8_history_plans={},
+        )
+    )
+
+    # Precompute rank1 raw chunks to simulate real 2-rank all_gather
+    h_r1 = C8PrefillHistory.prepare(
+        cache_r1,
+        table,
+        torch.tensor([[128], [128]], dtype=torch.int64),
+        torch.tensor([[0], [128]], dtype=torch.int64),
+    )
+    r1_raw = [h_r1.read_raw(cache_r1, 0), h_r1.read_raw(cache_r1, 1)]
+    ag_dtypes = []
+    ag_idx = {"i": 0}
+
+    def fake_all_gather(tensor, dim):
+        assert dim == 0
+        ag_dtypes.append(tensor.dtype)
+        peer = r1_raw[ag_idx["i"]]
+        ag_idx["i"] += 1
+        return torch.cat([tensor, peer], dim=0)
+
+    impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+    impl.kimi_c8_static_fp8 = True
+    impl.kimi_c8_manager_block_size = block_size
+    impl.kimi_c8_page_stride_bytes = block_size * 576
+    impl.kv_lora_rank = 512
+    impl.qk_nope_head_dim = 4
+    impl.qk_rope_head_dim = 64
+    impl.v_head_dim = 4
+    impl.num_heads = 3
+    impl.head_padding = 1
+    impl.scale = 1.0
+    impl.fa_quant_layer = False
+    impl.support_fp8_attention = False
+    impl.fak_descale_float = scale
+    impl.W_UK_T = torch.randn(3, 4, 512, dtype=torch.bfloat16) * 0.05
+    impl._c8_w_uv_prefill = torch.randn(512, 3 * 4, dtype=torch.bfloat16) * 0.05
+    impl.get_context_block_table = lambda m: table
+    impl._kimi_c8_physical_table = lambda t: t
+    impl._dcp_all_gather = fake_all_gather
+
+    captured = []
+
+    def fake_fia(query, key, value, **kwargs):
+        captured.append((query, key.clone(), value.clone()))
+        return torch.zeros(4, 3, 4, dtype=torch.bfloat16), torch.zeros(3, 4, dtype=torch.float32)
+
+    q_nope = torch.randn(4, 3, 4, dtype=torch.bfloat16)
+    q_pe = torch.randn(4, 3, 64, dtype=torch.bfloat16)
+    precomp_q = torch.cat((q_nope, q_pe), dim=-1)
+    prefix_out = torch.zeros(4, 3, 4, dtype=torch.bfloat16)
+    prefix_lse = torch.zeros(3, 4, dtype=torch.float32)
+
+    with (
+        patch.object(mla_v1, "torch_npu", SimpleNamespace(npu_fused_infer_attention_score=fake_fia)),
+        patch.object(
+            mla_v1,
+            "merge_prefill_chunks",
+            side_effect=lambda outs, lses, anc, return_lse: (outs[0], lses[0] if return_lse else None, anc),
+        ),
+    ):
+        impl._compute_prefill_context(
+            q_nope,
+            q_pe,
+            (cache_r0,),
+            64,
+            meta,
+            prefix_out,
+            prefix_lse,
+            precomputed_query=precomp_q,
+        )
+
+    assert ag_dtypes == [torch.uint8, torch.uint8]
+    assert len(captured) == 2
+    assert captured[0][0].data_ptr() == precomp_q.data_ptr()
+    assert captured[1][0].data_ptr() == precomp_q.data_ptr()
+
+    # Reference: old order (dequant locally -> all_gather BF16 -> slice valid spans -> project)
+    h_r0 = C8PrefillHistory.prepare(
+        cache_r0,
+        table,
+        torch.tensor([[128], [128]], dtype=torch.int64),
+        torch.tensor([[0], [128]], dtype=torch.int64),
+    )
+    for idx, valid_r1 in enumerate([128, 80]):
+        ref_r0 = h_r0.read(cache_r0, idx, scale, dtype=torch.bfloat16)
+        ref_r1 = _dequantize_static_fp8(r1_raw[idx], scale, torch.bfloat16)
+        ref_packed = torch.cat([ref_r0, ref_r1[:valid_r1]], dim=0)
+        ref_kvc, ref_kpe = ref_packed.split([512, 64], dim=-1)
+        ref_kn, ref_v = impl._project_c8_prefill_kv(ref_kvc.reshape(-1, 512))
+        ref_key = torch.cat((ref_kn, ref_kpe.expand((*ref_kn.shape[:-1], -1))), dim=-1)
+        assert torch.equal(captured[idx][1], ref_key)
+        assert torch.equal(captured[idx][2], ref_v)

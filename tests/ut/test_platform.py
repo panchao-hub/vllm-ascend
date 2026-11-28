@@ -20,6 +20,7 @@ from vllm_ascend.platform import (
     _validate_deepseek_v4_tp_config,
     _validate_draft_decode_context_parallel_config,
     _validate_eplb_config,
+    _validate_kv_load_failure_policy,
     _validate_parallel_config,
     _validate_pcp_dcp_config,
     _validate_routing_replay_config,
@@ -1861,6 +1862,32 @@ class TestNPUPlatform(TestBase):
         self.assertIsNone(vllm_config.scheduler_config.scheduler_cls)
         self.assertIn("recompute_scheduler_enable is ignored", mock_warning.call_args.args[0])
 
+    def test_validate_kv_load_failure_policy_allows_c8_store_recompute(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(is_hybrid=True),
+            additional_config={"mla_cache_mode": "C8"},
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_module_path=None,
+                is_kv_producer=True,
+                kv_load_failure_policy="recompute",
+                kv_connector_extra_config={
+                    "connectors": [
+                        {
+                            "kv_connector": "AscendStoreConnector",
+                            "kv_connector_extra_config": {"load_async": True},
+                        },
+                        {"kv_connector": "MooncakeConnectorV2"},
+                    ]
+                },
+            ),
+        )
+
+        _validate_kv_load_failure_policy(vllm_config)
+        vllm_config.kv_transfer_config.kv_connector_extra_config["connectors"][0]["kv_connector_extra_config"] = None
+        with pytest.raises(AssertionError, match="load_async=true"):
+            _validate_kv_load_failure_policy(vllm_config)
+
     def test_validate_kv_load_failure_policy_rejects_hybrid_recompute(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.model_config.is_hybrid = True
@@ -1870,6 +1897,22 @@ class TestNPUPlatform(TestBase):
             from vllm_ascend import platform
 
             platform._validate_kv_load_failure_policy(vllm_config)
+
+    def test_validate_kv_load_failure_policy_rejects_c8_p2p_only_recompute(self):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(is_hybrid=True),
+            additional_config={"mla_cache_mode": "C8"},
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_module_path=None,
+                is_kv_producer=False,
+                kv_load_failure_policy="recompute",
+                kv_connector_extra_config={"connectors": [{"kv_connector": "MooncakeConnectorV2"}]},
+            ),
+        )
+
+        with pytest.raises(AssertionError, match="producer-side Mooncake Store"):
+            _validate_kv_load_failure_policy(vllm_config)
 
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch(

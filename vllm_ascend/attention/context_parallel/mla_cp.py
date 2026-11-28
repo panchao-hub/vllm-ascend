@@ -1140,33 +1140,18 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         attn_output = self._merge_dcp_attention_output(attn_output, softmax_lse)
         return self._v_up_proj_batch_major(attn_output)
 
-    def _reorg_kvcache(
+    def _reorg_packed_kvcache(
         self,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
+        packed_kv_c_k_pe: torch.Tensor,
         chunked_context: ChunkedContextMetadata,
         chunk_idx: int,
         toks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
-        e.g.
-        kv_c_normed in rank0 = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...]
-        kv_c_normed in rank1 = [T0_4, T0_5, pad, pad, T1_2, pad, ...]
-        allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
-                                T0_4, T0_5, pad, pad, T1_2, pad, ...]
-        -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
-                                    T1_0, T1_1, T1_2, ...]
-        Args:
-            padded_local_chunk_seq_lens_lst: local chunk context lengths
-                under current CP rank.
-            local_context_lens_allranks: local context lengths on each CP rank.
-            sum_seq_len: the sum of cp_chunk_seq_lens_lst.
-            max_seq_len: the max value of cp_chunk_seq_lens_lst.
-            chunk_size: the local padded max context chunk from
-                chunked_context_metadata building.
-            chunk_idx: chunk idx of chunked_prefill.
-            toks: the number of tokens for local gather cache.
+    ) -> torch.Tensor:
+        """All-gather and unpad packed [kv_c, k_pe] rows across DCP ranks.
+
+        Accepts either quantized uint8 FP8 rows (cutting HCCL traffic in half)
+        or dequantized floating-point rows, coalescing adjacent spans so full
+        chunks return a zero-copy slice view.
         """
         assert isinstance(chunked_context, DCPChunkedContextMetadata)
         assert chunked_context.padded_local_chunk_seq_lens is not None
@@ -1182,15 +1167,9 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         max_seq_len = chunked_context.max_seq_lens[chunk_idx]
         chunk_size: int = chunked_context.chunk_size
         kv_rank_offsets = chunked_context.kv_rank_offsets[chunk_idx]
-        cache_kv_c_k_pe = torch.cat([kv_c_normed, k_pe], dim=-1)
-        cache_kv_c_k_pe = self._dcp_all_gather(cache_kv_c_k_pe, 0)
+        cache_kv_c_k_pe = self._dcp_all_gather(packed_kv_c_k_pe.contiguous(), 0)
 
-        allgatered_kv_c_normed, allgatered_k_pe = cache_kv_c_k_pe.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-
-        kv_c_segments = []
-        k_pe_segments = []
+        spans: list[tuple[int, int]] = []
         src_token_idx = 0
         max_seq_len_check = 0
         for row, local_context_lens in enumerate(local_context_lens_allranks):
@@ -1218,20 +1197,27 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
                 )
                 if local_chunk_len != 0:
                     src_start = kv_rank_offsets[rank] + src_token_idx
-                    kv_c_segment = allgatered_kv_c_normed[src_start : src_start + local_chunk_len]
-                    k_pe_segment = allgatered_k_pe[src_start : src_start + local_chunk_len]
-                    kv_c_segments.append(kv_c_segment)
-                    k_pe_segments.append(k_pe_segment)
+                    src_end = src_start + local_chunk_len
+                    if spans and spans[-1][1] == src_start:
+                        spans[-1] = (spans[-1][0], src_end)
+                    else:
+                        spans.append((src_start, src_end))
                     cur_seq_len += local_chunk_len
             max_seq_len_check = max(max_seq_len_check, cur_seq_len)
             src_token_idx += padded_local_chunk_seq_len
-        if not kv_c_segments:
-            return kv_c_normed[:0], k_pe[:0]
-        reorganized_kv_c_normed = torch.cat(kv_c_segments, dim=0)
-        reorganized_k_pe = torch.cat(k_pe_segments, dim=0)
-        assert reorganized_kv_c_normed.shape[0] == sum_seq_len, (
+        if not spans:
+            return packed_kv_c_k_pe[:0]
+        if len(spans) == 1:
+            span_start, span_end = spans[0]
+            reorganized_packed = cache_kv_c_k_pe[span_start:span_end]
+        else:
+            reorganized_packed = torch.cat(
+                [cache_kv_c_k_pe[span_start:span_end] for span_start, span_end in spans],
+                dim=0,
+            )
+        assert reorganized_packed.shape[0] == sum_seq_len, (
             "DCP MLA KV reorg length mismatch: "
-            f"actual={reorganized_kv_c_normed.shape[0]}, "
+            f"actual={reorganized_packed.shape[0]}, "
             f"expected={sum_seq_len}, chunk_idx={chunk_idx}, "
             f"toks={toks}, chunk_size={chunk_size}, "
             f"padded_local_chunk_seq_lens="
@@ -1242,6 +1228,38 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
             f"max_seq_len={max_seq_len}, "
             f"max_seq_len_check={max_seq_len_check}"
         )
-        assert reorganized_k_pe.shape[0] == sum_seq_len
         assert max_seq_len_check == max_seq_len
+        return reorganized_packed
+
+    def _reorg_kvcache(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        chunked_context: ChunkedContextMetadata,
+        chunk_idx: int,
+        toks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        reorg and unpad kvcache after cp local gather to tp layout for attn kernel.
+        e.g.
+        kv_c_normed in rank0 = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...]
+        kv_c_normed in rank1 = [T0_4, T0_5, pad, pad, T1_2, pad, ...]
+        allgatered_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T1_0, T1_1, ...,
+                                T0_4, T0_5, pad, pad, T1_2, pad, ...]
+        -> reorganized_kv_c_normed = [T0_0, T0_1, T0_2, T0_3, T0_4, T0_5,
+                                    T1_0, T1_1, T1_2, ...]
+        """
+        packed = torch.cat([kv_c_normed, k_pe], dim=-1)
+        reorganized_packed = self._reorg_packed_kvcache(
+            packed,
+            chunked_context=chunked_context,
+            chunk_idx=chunk_idx,
+            toks=toks,
+        )
+        if reorganized_packed.shape[0] == 0:
+            return kv_c_normed[:0], k_pe[:0]
+        reorganized_kv_c_normed, reorganized_k_pe = reorganized_packed.split(
+            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        assert reorganized_k_pe.shape[0] == reorganized_kv_c_normed.shape[0]
         return reorganized_kv_c_normed, reorganized_k_pe

@@ -407,6 +407,115 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         )
         return hidden_states
 
+    def _can_skip_draft_generation(
+        self,
+        input_batch: InputBatch,
+        dp_sync: Any,
+        *,
+        dummy_run: bool,
+        is_profile: bool,
+    ) -> bool:
+        """Return True when every request in the step is a non-final prefill chunk.
+
+        Upstream Scheduler.update_draft_token_ids discards draft tokens for
+        intermediate prefill chunks (`request.is_prefill_chunk`), so only the
+        draft context KV write (`precompute_and_store_context_kv`) is needed.
+        """
+        if (
+            dummy_run
+            or is_profile
+            or dp_sync is not None
+            or self.dp_size > 1
+            or self.replicated_pcp
+            or self.enable_adaptive_verification
+            or not input_batch.has_prefill
+            or input_batch.num_reqs <= 0
+            or input_batch.num_draft_tokens != 0
+        ):
+            return False
+        num_reqs = input_batch.num_reqs
+        return bool(
+            np.all(
+                input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+                < input_batch.prefill_len_np[:num_reqs]
+            )
+        )
+
+    # Mirrors upstream DFlashSpeculator.propose context-KV write only; remove once upstream adds a skip_draft hook.
+    def _store_intermediate_prefill_context_kv(
+        self,
+        input_batch: InputBatch,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> torch.Tensor:
+        num_reqs = input_batch.num_reqs
+        num_target_tokens = input_batch.num_tokens
+        # seq_lens_cpu_upper_bound resides on CPU; int(max()) incurs no device sync.
+        max_seq_len = int(input_batch.seq_lens_cpu_upper_bound[:num_reqs].max())
+        self.draft_max_seq_len = min(max_seq_len + self.num_query_per_req, self.max_model_len)
+
+        if aux_hidden_states:
+            hidden_states = self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
+        else:
+            hidden_states = last_hidden_states
+        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+
+        if self.pcp_manager is not None:
+            self.block_tables.gather_block_tables(input_batch.idx_mapping, num_reqs_padded=num_reqs)
+
+        assert self.draft_kv_cache_group_id >= 0
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            dflash_speculator.prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.block_tables.cp_size,
+                self.block_tables.cp_interleave,
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+            )
+
+        if self._layer_group_idx is not None:
+            context_slots: torch.Tensor | list[torch.Tensor | None] | None = [
+                self._context_slot_mappings[gidx][:num_target_tokens] for gidx in self._layer_group_idx
+            ]
+        else:
+            context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:num_target_tokens],
+            self.context_positions[:num_target_tokens],
+            context_slots,
+        )
+        self.draft_tokens[:num_reqs].zero_()
+        return self.draft_tokens[:num_reqs]
+
     def propose(
         self,
         input_batch: InputBatch,
@@ -428,6 +537,23 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     ) -> torch.Tensor:
         self.input_batch = input_batch
         assert self.input_batch is not None
+        if self._can_skip_draft_generation(
+            input_batch,
+            dp_sync,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+        ):
+            return self._store_intermediate_prefill_context_kv(
+                input_batch,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+            )
         # TODO: Remove the adaptive verification condition once upstream vLLM
         # synchronizes the draft DP shape independently of the target.
         # Replicated drafts consume global requests, unlike sharded targets.

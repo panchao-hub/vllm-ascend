@@ -297,6 +297,20 @@ class TestAscendStoreCoordinator(unittest.TestCase):
 
                 self.assertEqual(coord.find_reachable_hit_tokens(hashes, 1024, query), 768)
 
+    def test_dcp_mamba_store_mask_keeps_only_common_boundaries(self):
+        state = MambaSpec(block_size=256, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align")
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["attention"], _full_spec(512)), KVCacheGroupSpec(["state"], state)],
+            scheduler_block_size=512,
+            hash_block_size=256,
+            group_block_sizes=[512, 256],
+            group_cache_families=["default", "default"],
+            retention_interval=None,
+        )
+
+        self.assertEqual(coord.store_mask(1024)[1], [False, True, False, True])
+        self.assertEqual(coord.lookup_mask(1024)[1], [False, True, False, True])
+
     def test_legacy_reachable_mask_ignores_new_boundary_argument(self):
         class LegacyManager:
             @staticmethod

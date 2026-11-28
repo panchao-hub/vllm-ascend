@@ -1,5 +1,6 @@
 import importlib
 import math
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -22,6 +23,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend.ascend_config import is_kimi_c8_config
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_layerwise_data_plane,
@@ -49,10 +51,13 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     get_block_hashes,
     get_group_block_size,
     get_group_cache_family,
+    infer_cache_namespace,
     infer_cache_transfer_granularity,
     infer_cacheable_group_ids,
     infer_group_block_sizes,
     infer_group_cache_families,
+    infer_store_group_block_sizes,
+    infer_store_hash_block_size,
     infer_tp_mismatch_info,
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
@@ -60,6 +65,11 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metrics import (
     AscendStoreKVConnectorStats,
 )
+
+# Deduplicate repeated Store lookups for waiting requests blocked at the head
+# of the scheduler queue across consecutive chunked-prefill steps.
+WAITING_LOOKUP_CACHE_TTL_SECONDS = 2.0
+MAX_WAITING_LOOKUP_CACHE_SIZE = 256
 
 
 class KVPoolScheduler:
@@ -89,6 +99,8 @@ class KVPoolScheduler:
         if self.compress_ratios is None:
             self.compress_ratios = getattr(hf_config, "compress_ratios", None)
         kv_cache_groups = kv_cache_config.kv_cache_groups if kv_cache_config is not None else None
+        self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
+        self.cache_namespace = infer_cache_namespace(kv_cache_groups, extra_config, dcp_size=self.dcp_size)
         self.use_hybrid = uses_hybrid_kv_cache(vllm_config.scheduler_config, kv_cache_groups) or (
             self.use_block_key_layerwise and kv_cache_groups is not None and len(kv_cache_groups) > 1
         )
@@ -117,7 +129,6 @@ class KVPoolScheduler:
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
-        self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
         speculative_config = getattr(vllm_config, "speculative_config", None)
         use_eagle_fn = getattr(speculative_config, "use_eagle", None)
@@ -132,13 +143,8 @@ class KVPoolScheduler:
             and len(cacheable_block_sizes) != len(self.original_block_size)
         ):
             raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
-        self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
-        if not isinstance(requested_hash_block_size, int):
-            requested_hash_block_size = None
-        self.hash_block_size = (
-            requested_hash_block_size if requested_hash_block_size is not None else min(cacheable_block_sizes)
-        ) * self.dcp_size
+        self.grouped_block_size = infer_store_group_block_sizes(vllm_config, kv_cache_groups, self.dcp_size)
+        self.hash_block_size = infer_store_hash_block_size(vllm_config, cacheable_block_sizes, self.dcp_size)
         for group_id in self.cacheable_group_ids:
             group_block_size = self.grouped_block_size[group_id]
             assert group_block_size % self.hash_block_size == 0, "block_size must be divisible by hash_block_size"
@@ -157,6 +163,9 @@ class KVPoolScheduler:
         )
         self._unfinished_requests: dict[str, tuple[Request, list[list[int]]]] = {}
         self._loading_req_ids: set[str] = set()
+        self._failed_async_load_req_ids: set[str] = set()
+        # request_id -> (token_len, num_computed_tokens, num_external_hit_tokens, timestamp)
+        self._waiting_lookup_cache: dict[str, tuple[int, int, int, float]] = {}
 
         self._block_pool: BlockPool | None = None
         self.sending_event_id = 0
@@ -293,6 +302,7 @@ class KVPoolScheduler:
                                 pp_rank,
                                 kv_cache_group_id=kv_cache_group_id,
                                 cache_family=cache_family,
+                                namespace=self.cache_namespace,
                             ),
                             chunk_hash,
                         )
@@ -613,10 +623,17 @@ class KVPoolScheduler:
         # A waiting request can be looked up again before it is admitted.
         # Never retain a load plan from an earlier hit across a miss/early return.
         self.load_specs.pop(request.request_id, None)
+        if request.request_id in self._failed_async_load_req_ids:
+            self._waiting_lookup_cache.pop(request.request_id, None)
+            return 0, False
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_load:
             return 0, False
 
+        reused_waiting_lookup = False
         prompt_token_len = len(request.prompt_token_ids)
+        final_block_start = (
+            (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size if self.use_eagle else None
+        )
         if self.use_block_key_layerwise:
             token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
             if token_len < self.cache_transfer_granularity:
@@ -631,6 +648,11 @@ class KVPoolScheduler:
             else:
                 token_len = prompt_token_len
 
+            if final_block_start is not None and self.use_hybrid and is_kimi_c8_config(self.vllm_config):
+                # Query the resume boundary itself. Aligned recurrent state is
+                # sparse, so a later hit does not prove the preceding block.
+                token_len = min(token_len, final_block_start)
+
             if token_len < self.cache_transfer_granularity:
                 return 0, False
 
@@ -640,21 +662,57 @@ class KVPoolScheduler:
                 )
             else:
                 if num_computed_tokens >= token_len:
+                    logger.debug(
+                        "KV pool skip lookup req=%s hbm_hit_tokens=%d store_lookup_limit=%d",
+                        request.request_id,
+                        num_computed_tokens,
+                        token_len,
+                    )
                     return 0, False
-                if self.client is None:
-                    self.client = LookupKeyClient(self.vllm_config)
-                num_external_hit_tokens = self.client.lookup(
-                    token_len,
-                    request.block_hashes,
-                    self.kv_cache_group_ids,
-                    hbm_hit_tokens=num_computed_tokens,
-                )
+                if is_kimi_c8_config(self.vllm_config):
+                    now = time.monotonic()
+                    cached_lookup = self._waiting_lookup_cache.get(request.request_id)
+                    if (
+                        cached_lookup is not None
+                        and cached_lookup[0] == token_len
+                        and cached_lookup[1] == num_computed_tokens
+                        and (now - cached_lookup[3]) < WAITING_LOOKUP_CACHE_TTL_SECONDS
+                    ):
+                        num_external_hit_tokens = cached_lookup[2]
+                        reused_waiting_lookup = True
+                    else:
+                        if self.client is None:
+                            self.client = LookupKeyClient(self.vllm_config)
+                        num_external_hit_tokens = self.client.lookup(
+                            token_len,
+                            request.block_hashes,
+                            self.kv_cache_group_ids,
+                            hbm_hit_tokens=num_computed_tokens,
+                        )
+                        self._waiting_lookup_cache.pop(request.request_id, None)
+                        if len(self._waiting_lookup_cache) >= MAX_WAITING_LOOKUP_CACHE_SIZE:
+                            self._waiting_lookup_cache.pop(next(iter(self._waiting_lookup_cache)))
+                        self._waiting_lookup_cache[request.request_id] = (
+                            token_len,
+                            num_computed_tokens,
+                            num_external_hit_tokens,
+                            now,
+                        )
+                else:
+                    if self.client is None:
+                        self.client = LookupKeyClient(self.vllm_config)
+                    num_external_hit_tokens = self.client.lookup(
+                        token_len,
+                        request.block_hashes,
+                        self.kv_cache_group_ids,
+                        hbm_hit_tokens=num_computed_tokens,
+                    )
 
         if num_external_hit_tokens == 0:
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
-        if self.use_eagle:
+        if final_block_start is not None:
             # Keep the draft model's recomputation zone intact: the
             # generation-point hidden states must be freshly computed, and the
             # local prefix-cache path already drops its trailing block
@@ -668,7 +726,6 @@ class KVPoolScheduler:
             # containing the last token; num_tokens - lcm_block_size equals
             # that boundary only for lcm-aligned prompts and over-trims
             # unaligned prompts whose hit stops exactly on the boundary.
-            final_block_start = (request.num_tokens - 1) // self.lcm_block_size * self.lcm_block_size
             hit_reaches_final_block = num_external_hit_tokens > final_block_start
             if hit_reaches_final_block:
                 num_external_hit_tokens = max(
@@ -687,10 +744,12 @@ class KVPoolScheduler:
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
+        log_fn = logger.debug if reused_waiting_lookup else logger.info
+        log_fn(
+            "Reqid: %s, Total tokens %d, local hit: %d, total hit: %d, external load: %d",
             request.request_id,
             request.num_tokens,
+            num_computed_tokens,
             num_external_hit_tokens,
             need_to_allocate,
         )
@@ -732,6 +791,7 @@ class KVPoolScheduler:
         if num_external_tokens > 0:
             local_block_ids = normalize_block_ids_by_group(blocks.get_block_ids())
 
+        self._waiting_lookup_cache.pop(request.request_id, None)
         self._unfinished_requests[request.request_id] = (request, local_block_ids)
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
@@ -980,7 +1040,6 @@ class KVPoolScheduler:
             request_tracker,
             self.cache_transfer_granularity,
             load_spec=load_spec,
-            skip_save=None,
             block_hashes=request.block_hashes,
             discard_partial_chunks=self._discard_partial_chunks,
             original_block_size=self.original_block_size,
@@ -1001,12 +1060,18 @@ class KVPoolScheduler:
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._preempted_req_ids.discard(finished_req_id)
+            self._failed_async_load_req_ids.discard(finished_req_id)
+            self._waiting_lookup_cache.pop(finished_req_id, None)
+
+        if scheduler_output.finished_req_ids:
+            self._clear_waiting_zero_hits()
 
         for req_id in scheduler_output.preempted_req_ids:
             self._preempted_req_ids.update(scheduler_output.preempted_req_ids)
             self._request_trackers.pop(req_id, None)
             self._unfinished_requests.pop(req_id, None)
             self._loading_req_ids.discard(req_id)
+            self._waiting_lookup_cache.pop(req_id, None)
 
         meta = AscendConnectorMetadata(
             scheduler_output.preempted_req_ids,
@@ -1109,14 +1174,36 @@ class KVPoolScheduler:
         self.sending_events[using_event_id] = 0
         self.sending_blocks[using_event_id] = current_step_sending
 
+    def _clear_waiting_zero_hits(self) -> None:
+        for req_id in [k for k, entry in self._waiting_lookup_cache.items() if entry[2] == 0]:
+            self._waiting_lookup_cache.pop(req_id, None)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
         hand the connector_output, free non-null mamba blocks and so on.
         """
+        invalid_blocks = connector_output.invalid_block_ids
+        if invalid_blocks and is_kimi_c8_config(self.vllm_config):
+            null_block_id = self._block_pool.null_block.block_id if self._block_pool is not None else 0
+            invalid_blocks = invalid_blocks - {null_block_id}
+            for req_id in self._loading_req_ids:
+                unfinished = self._unfinished_requests.get(req_id)
+                if unfinished is None:
+                    # An aborted request can still have a receive in flight.
+                    continue
+                _, groups = unfinished
+                if any(not invalid_blocks.isdisjoint(group) for group in groups):
+                    # A key can still exist even when its bytes cannot be
+                    # loaded. Let the scheduler recompute instead of retrying it.
+                    self._failed_async_load_req_ids.add(req_id)
         self.update_finished_recving(connector_output.finished_recving)
 
         meta = connector_output.kv_connector_worker_meta
-        if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata) or self._block_pool is None:
+        if not isinstance(meta, AscendStoreKVConnectorWorkerMetadata):
+            return
+        if meta.completed_events:
+            self._clear_waiting_zero_hits()
+        if self._block_pool is None:
             return
 
         for event_id, count in meta.completed_events.items():

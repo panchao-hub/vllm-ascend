@@ -35,6 +35,7 @@ from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 from vllm.v1.worker import mamba_utils
 
+from vllm_ascend.ascend_config import is_kimi_c8_config
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_layerwise_data_plane,
     get_layerwise_protocol,
@@ -97,6 +98,15 @@ class AscendStoreKVEvents(KVConnectorKVEvents):
 
 
 class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        return (
+            self.kv_role == "kv_producer"
+            and self.backend_name == "mooncake"
+            and not self.use_layerwise
+            and is_kimi_c8_config(self._vllm_config)
+        )
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """

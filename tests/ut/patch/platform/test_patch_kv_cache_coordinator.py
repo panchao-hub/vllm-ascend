@@ -184,6 +184,18 @@ def test_coordinator_non_producer_tag(monkeypatch):
     assert coordinator.skips_eagle_block_drop is False
 
 
+@pytest.mark.parametrize("producer", [True, False])
+def test_mamba_checkpoint_drop_matches_pd_role(monkeypatch, producer):
+    monkeypatch.setattr(mod, "MambaManager", _FakeMambaManager)
+    coordinator = _make_coordinator(
+        monkeypatch,
+        use_eagle=True,
+        kv_transfer_config=_kv_transfer_config(is_kv_producer=producer, is_kv_consumer=not producer),
+    )
+    manager = coordinator.single_type_managers[1]
+    assert getattr(manager, "drop_eagle_checkpoint_block", False) == (not producer)
+
+
 def test_coordinator_reads_standalone_drop_exemption(monkeypatch):
     # No kv-transfer config attached: a standalone instance. Not a PD
     # producer, but every content-hash match is a verified local prompt

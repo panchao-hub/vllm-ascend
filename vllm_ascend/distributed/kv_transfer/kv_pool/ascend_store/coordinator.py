@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -256,6 +257,22 @@ class AscendStoreCoordinator:
                 num_prompt_tokens=num_prompt_tokens,
                 reachable_boundaries=reachable_boundaries,
             )
+            if (
+                isinstance(spec, MambaSpec)
+                and getattr(spec, "mamba_cache_mode", None) == "align"
+                and self.group_effective_block_sizes[group_id] < self.lcm_block_size
+                and self.lcm_block_size % self.group_effective_block_sizes[group_id] == 0
+            ):
+                # An aligned recurrent state is reusable only at the common
+                # hybrid boundary. Keep one KDA slot per LCM-sized block even
+                # when the manager has no sparse-retention mask.
+                ratio = self.lcm_block_size // self.group_effective_block_sizes[group_id]
+                boundary_mask = [(index + 1) % ratio == 0 for index in range(num_chunks)]
+                mask = (
+                    boundary_mask
+                    if mask is None
+                    else [value and boundary for value, boundary in zip(mask, boundary_mask, strict=True)]
+                )
             masks.append((num_chunks, mask))
         return masks
 

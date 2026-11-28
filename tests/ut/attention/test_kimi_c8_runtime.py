@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm_ascend.attention import kimi_c8_decode as projections
 from vllm_ascend.attention import mla_v1
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel import common_cp, mla_cp
 from vllm_ascend.attention.kimi_c8_graph import C8MetadataEvents
 from vllm_ascend.attention.kimi_c8_static import pa_nz_cache_view, write_static_fp8_cache
 from vllm_ascend.attention.mla_v1 import AscendMLAImpl, AscendMLAMetadataBuilder
@@ -322,7 +323,7 @@ def builder(monkeypatch):
 
     monkeypatch.setattr(mla_v1.MLACommonMetadataBuilder, "__init__", parent)
     monkeypatch.setattr(mla_v1, "enable_dcp", lambda: False)
-    monkeypatch.setattr(mla_v1, "get_ascend_config", lambda: Ns())
+    monkeypatch.setattr(mla_v1, "get_ascend_config", lambda: Ns(enable_multi_streams=False))
     spec = AscendMLAAttentionSpec(
         block_size=1664, num_kv_heads=1, head_size=576, dtype=torch.float8_e4m3fn, static_fp8_pa_nz=True
     )
@@ -341,6 +342,42 @@ def test_draft_flashmla_metadata_uses_128_reader_page(builder, monkeypatch):
     assert result.flashmla_state is factory.return_value
     assert factory.call_args.kwargs["cache_block_size"] == 128
     assert config.cache_config.block_size == 1664
+
+
+@pytest.mark.parametrize("history_lengths", [[1024 * 1024 - 2048], [500000, 500123]])
+def test_c8_dcp8_prefill_bounds_aggregate_projected_history(builder, monkeypatch, history_lengths):
+    config = builder.vllm_config
+    config.parallel_config.decode_context_parallel_size = 8
+    config.parallel_config.cp_kv_cache_interleave_size = 1664
+    impl = config.compilation_config.static_forward_context["mla"].impl
+    impl.head_padding, impl.num_heads = 4, 12
+    impl.qk_nope_head_dim, impl.qk_rope_head_dim, impl.v_head_dim = 128, 64, 128
+    group = Ns(world_size=8, rank_in_group=0, ranks=list(range(8)))
+    monkeypatch.setattr(mla_cp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(common_cp, "get_dcp_group", lambda: group)
+
+    zeros = torch.zeros
+
+    def cpu_zeros(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", cpu_zeros)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    dcp = mla_cp.AscendMlaDCPMetadataBuilder(builder.kv_cache_spec, ["mla"], config, torch.device("cpu"))
+    dcp.chunked_prefill_enabled = True
+    dcp.chunked_prefill_workspace_size = 64 * 1664 * 8
+    dcp.chunked_prefill_workspace = torch.empty(0)
+    dcp.num_prefills = len(history_lengths)
+    dcp.query_lens = torch.full((len(history_lengths),), 2048, dtype=torch.int32)
+    dcp.seq_lens = torch.tensor(history_lengths, dtype=torch.int32) + dcp.query_lens
+    metadata = dcp.build_chunked_metadata(0, Ns(num_reqs=len(history_lengths)))
+
+    bytes_per_row = 12 * ((128 + 128) + (128 + 64) + 128) * 2
+    assert metadata.chunk_seq_lens.sum(dim=0).tolist() == history_lengths
+    assert int(metadata.chunk_seq_lens.sum(dim=1).max()) * bytes_per_row <= 1 << 30
+    assert dcp.max_context_chunk == metadata.chunk_size * 8
+    assert dcp.max_context_chunk % (1664 * 8) == 0
 
 
 @pytest.mark.parametrize("query_lens", [[1, 1], [512] * 32, [16384]])
@@ -645,3 +682,37 @@ def test_native_dcp_keeps_request_batch_40(monkeypatch, metadata_op, graph):
     assert fa.call_args.kwargs["cu_seqlens_q"].shape == (41,)
     assert fa.call_args.kwargs["seqused_q"].tolist() == [4] * 40
     assert fa.call_args.kwargs["mask_mode"] == 0 and fa.call_args.kwargs["max_seqlen_q"] == -1
+
+
+def test_c8_history_budget_caps_chunk_at_384mib_and_supports_dcp2(builder, monkeypatch):
+    config = builder.vllm_config
+    config.parallel_config.decode_context_parallel_size = 2
+    config.parallel_config.cp_kv_cache_interleave_size = 1664
+    impl = config.compilation_config.static_forward_context["mla"].impl
+    impl.head_padding, impl.num_heads = 4, 12
+    impl.qk_nope_head_dim, impl.qk_rope_head_dim, impl.v_head_dim = 128, 64, 128
+    group = Ns(world_size=2, rank_in_group=0, ranks=[0, 1])
+    monkeypatch.setattr(mla_cp, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(common_cp, "get_dcp_group", lambda: group)
+
+    zeros = torch.zeros
+
+    def cpu_zeros(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", cpu_zeros)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    dcp = mla_cp.AscendMlaDCPMetadataBuilder(builder.kv_cache_spec, ["mla"], config, torch.device("cpu"))
+    dcp.chunked_prefill_enabled = True
+    dcp.chunked_prefill_workspace_size = 64 * 1664 * 2
+    dcp.chunked_prefill_workspace = torch.empty(0)
+    dcp.num_prefills = 1
+    dcp.query_lens = torch.tensor([13312], dtype=torch.int32)
+    dcp.seq_lens = torch.tensor([349440 + 13312], dtype=torch.int32)
+    metadata = dcp.build_chunked_metadata(0, Ns(num_reqs=1))
+
+    bytes_per_row = 12 * ((128 + 128) + (128 + 64) + 128) * 2
+    assert int(metadata.chunk_seq_lens.sum(dim=1).max()) * bytes_per_row <= mla_v1.C8_HISTORY_WORKSPACE_BUDGET_BYTES
+    assert dcp.max_context_chunk == 26624
+    assert metadata.chunk_size == 13312

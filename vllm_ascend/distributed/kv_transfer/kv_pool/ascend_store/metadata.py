@@ -12,9 +12,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadat
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList
-from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.ascend_config import is_kimi_c8_config
+from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable, resolve_dcp_cache_block_sizes
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 
 
@@ -131,6 +132,8 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
+    """ Deployment namespace that isolates incompatible cache formats. """
+    namespace: str = "default"
 
 
 @dataclass(order=True)
@@ -148,13 +151,16 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.namespace,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
+        namespace = f"@namespace:{self.key_metadata.namespace}" if self.key_metadata.namespace != "default" else ""
         return (
             f"{self.key_metadata.model_name}"
+            f"{namespace}"
             f"@dcp:{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@pp_rank:{self.key_metadata.pp_rank}"
@@ -193,14 +199,17 @@ class LayerPoolKey(PoolKey):
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.namespace,
                 self.chunk_hash,
                 self.layer_id,
             )
         )
 
     def to_string(self):
+        namespace = f"@namespace:{self.key_metadata.namespace}" if self.key_metadata.namespace != "default" else ""
         return (
             f"{self.key_metadata.model_name}"
+            f"{namespace}"
             f"@dcp:{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@group:{self.key_metadata.kv_cache_group_id}"
@@ -209,6 +218,44 @@ class LayerPoolKey(PoolKey):
             f"@layer_id:{self.layer_id}"
             f"@{self.chunk_hash}"
         )
+
+
+def _get_cache_salt(extra_config: Mapping[str, Any] | None) -> str:
+    if not extra_config:
+        return "default"
+    cache_salt = extra_config.get("cache_salt")
+    if cache_salt is None:
+        for connector in extra_config.get("connectors", ()):
+            if not isinstance(connector, Mapping) or connector.get("kv_connector") != "AscendStoreConnector":
+                continue
+            cache_salt = (connector.get("kv_connector_extra_config") or {}).get("cache_salt")
+            break
+    return str(cache_salt).strip() if cache_salt is not None and str(cache_salt).strip() else "default"
+
+
+def infer_cache_namespace(kv_cache_groups, extra_config: Mapping[str, Any] | None = None, *, dcp_size: int = 1) -> str:
+    """Build a stable namespace for a deployed KV format and cache salt."""
+    is_c8 = False
+    for group in kv_cache_groups or ():
+        spec = getattr(group, "kv_cache_spec", None)
+        specs = getattr(spec, "kv_cache_specs", None)
+        values = specs.values() if specs is not None else (spec,)
+        is_c8 = is_c8 or any(getattr(item, "static_fp8_pa_nz", False) for item in values if item is not None)
+    if not is_c8:
+        return "default"
+    format_name = f"c8-pa-nz-v2-dcp{dcp_size}" if dcp_size > 1 else "c8-pa-nz-v1"
+    return f"{format_name}:{_get_cache_salt(extra_config)}"
+
+
+def infer_store_hash_block_size(vllm_config, cacheable_block_sizes: Sequence[int], dcp_size: int) -> int:
+    cache_config = vllm_config.cache_config
+    if dcp_size > 1 and is_kimi_c8_config(vllm_config):
+        # Request.block_hashes use the engine's hash unit. DCP scales the
+        # logical cache block but does not scale each hash in a hybrid plan.
+        return resolve_dcp_cache_block_sizes(cacheable_block_sizes, dcp_size, cache_config.enable_prefix_caching)[1]
+    prefix_match_unit = cache_config.prefix_match_unit
+    hash_block_size = prefix_match_unit if isinstance(prefix_match_unit, int) else min(cacheable_block_sizes)
+    return hash_block_size * dcp_size
 
 
 def infer_cache_family_from_ratio(compress_ratio: int | None) -> str:
@@ -306,6 +353,20 @@ def infer_group_block_sizes(
     return block_sizes
 
 
+def infer_store_group_block_sizes(vllm_config, kv_cache_groups, dcp_size: int) -> list[int]:
+    sizes = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
+    logical_sizes = [size * dcp_size for size in sizes]
+    if dcp_size > 1 and is_kimi_c8_config(vllm_config) and vllm_config.cache_config.enable_prefix_caching:
+        # The hybrid allocator replicates Mamba token positions across DCP ranks.
+        for i, group in enumerate(kv_cache_groups or ()):
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            if isinstance(spec, MambaSpec):
+                logical_sizes[i] = sizes[i]
+    return logical_sizes
+
+
 def infer_cacheable_group_ids(kv_cache_groups: Sequence[Any] | None) -> list[int]:
     if not kv_cache_groups:
         return [0]
@@ -375,8 +436,10 @@ class ChunkedTokenDatabase:
         prefix = self._key_prefix_cache.get(cache_key)
         if prefix is None:
             group_metadata = self.metadata[kv_cache_group_id]
+            namespace = f"@namespace:{group_metadata.namespace}" if group_metadata.namespace != "default" else ""
             prefix = (
                 f"{group_metadata.model_name}"
+                f"{namespace}"
                 f"@dcp:{group_metadata.dcp_rank}"
                 f"@head_or_tp_rank:{group_metadata.head_or_tp_rank}"
                 f"@pp_rank:{group_metadata.pp_rank}"
@@ -395,6 +458,11 @@ class ChunkedTokenDatabase:
         if self.cache_coordinator is None:
             return None
         return self.cache_coordinator.store_mask(aligned_token_len, num_prompt_tokens)
+
+    def lookup_mask(self, aligned_token_len: int) -> tuple[list[bool] | None, ...] | None:
+        if self.cache_coordinator is None:
+            return None
+        return self.cache_coordinator.lookup_mask(aligned_token_len)
 
     def load_mask(
         self,
@@ -438,6 +506,7 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
+                namespace=group_metadata.namespace,
             ),
             chunk_hash,
         )

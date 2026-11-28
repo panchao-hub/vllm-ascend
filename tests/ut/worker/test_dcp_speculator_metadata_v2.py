@@ -78,6 +78,7 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     spec = object.__new__(cls)
     if kind == "dspark":
         spec._draft_mla_uses_device_lengths = False
+    spec.dp_size = 1
     spec.replicated_pcp = False
     spec.enable_adaptive_verification = False
     if kind == "mtp":
@@ -97,6 +98,7 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     spec.target_input_buffers = SimpleNamespace(seq_lens_cpu=target)
     spec._get_seq_lens_cpu = lambda n: target[:n]
     spec.input_batch = SimpleNamespace(
+        has_prefill=False,
         num_reqs=2,
         is_prefilling_np=np.array([True, False]),
         seq_lens_cpu_upper_bound=target[:2],

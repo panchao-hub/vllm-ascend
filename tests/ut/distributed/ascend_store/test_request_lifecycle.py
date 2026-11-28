@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput
@@ -189,6 +190,76 @@ def cache_entries(plan, caches):
 def payload_value(tokens, end, name, plane):
     # Independent of block IDs, hashes, keys and transfer metadata.
     return (sum(tokens[:end]) + sum(name.encode()) + plane * 11) % 101 + 1
+
+
+@pytest.mark.parametrize("store_hit", [False, True])
+def test_c8_producer_reconciles_divergent_local_prefix(devices_and_store, monkeypatch, store_hit):
+    monkeypatch.setitem(backend_map, "mooncake", backend_map["cpu"])
+    config = create_vllm_config(
+        block_size=128,
+        max_num_batched_tokens=512,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="AscendStoreConnector",
+            kv_role="kv_producer",
+            kv_connector_module_path="vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector",
+        ),
+    )
+    config.cache_config.mamba_cache_mode = "align"
+    config.scheduler_config.disable_hybrid_kv_cache_manager = False
+    config.cache_config.num_gpu_blocks = 64
+    plan = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target.mla"],
+                AscendMLAAttentionSpec(
+                    block_size=128, num_kv_heads=1, head_size=8, dtype=torch.float8_e4m3fn, static_fp8_pa_nz=True
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["target.kda"],
+                MambaSpec(block_size=128, shapes=((8,),), dtypes=(torch.float32,), mamba_cache_mode="align"),
+            ),
+        ],
+    )
+    scheduler = Scheduler(config, plan, StructuredOutputManager(config), block_size=128, hash_block_size=128)
+    # The CPU fixture supplies the cache specs directly without loading Kimi.
+    config.additional_config = {"mla_cache_mode": "C8"}
+    request = Request(
+        request_id="divergent",
+        prompt_token_ids=list(range(385)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(128, sha256),
+    )
+    # Two local MLA blocks, with the corresponding KDA state absent.
+    block_pool = scheduler.kv_cache_manager.block_pool
+    blocks = block_pool.get_new_blocks(2)
+    block_pool.cache_full_blocks(request, blocks, 0, 2, 128, 0)
+    block_pool.free_blocks(blocks)
+    lookup_calls = []
+
+    def lookup(token_len, block_hashes, group_ids, hbm_hit_tokens):
+        lookup_calls.append(hbm_hit_tokens)
+        return 384 if store_hit else 256
+
+    scheduler.connector.connector_scheduler.client = SimpleNamespace(lookup=lookup, close=lambda: None)
+    try:
+        assert scheduler.kv_cache_manager.get_computed_blocks_for_connector(request)[1:] == (256, 0, True)
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        assert lookup_calls == [256]
+        scheduled = output.num_scheduled_tokens[request.request_id]
+        assert request.num_computed_tokens - scheduled == (384 if store_hit else 0)
+        (meta,) = output.kv_connector_metadata.requests
+        if store_hit:
+            assert meta.load_spec.can_load
+            assert (meta.load_spec.vllm_cached_tokens, meta.load_spec.kvpool_cached_tokens) == (256, 384)
+        else:
+            assert meta.load_spec is None
+    finally:
+        scheduler.connector.shutdown()
 
 
 @pytest.mark.parametrize("role", [KVConnectorRole.SCHEDULER, KVConnectorRole.WORKER])

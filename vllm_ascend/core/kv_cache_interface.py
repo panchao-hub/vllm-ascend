@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Iterable
+import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -21,6 +22,15 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+
+def resolve_dcp_cache_block_sizes(
+    group_block_sizes: Sequence[int], dcp_size: int, enable_prefix_caching: bool
+) -> tuple[int, int]:
+    scheduler_block_size = math.lcm(*group_block_sizes) * dcp_size
+    if len(group_block_sizes) == 1 or not enable_prefix_caching:
+        return scheduler_block_size, scheduler_block_size
+    return scheduler_block_size, math.gcd(*group_block_sizes)
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:
@@ -89,6 +99,62 @@ def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
     return any(getattr(spec, "indexes_kv_by_block_stride", False) for spec in specs)
 
 
+def get_kv_connector_names(kv_transfer_config) -> tuple[str, ...]:
+    """Return registered connector names from a direct or composite config."""
+    name = getattr(kv_transfer_config, "kv_connector", None)
+    if name != "MultiConnector":
+        return (name,) if name else ()
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    return tuple(
+        child.get("kv_connector")
+        for child in extra_config.get("connectors", ())
+        if isinstance(child, dict) and child.get("kv_connector")
+    )
+
+
+def supports_c8_pd_connector(vllm_config: VllmConfig) -> bool:
+    """Whether the connector chain preserves the C8 raw MLA contract."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return True
+    if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
+        return False
+
+    name = getattr(kv_transfer_config, "kv_connector", None)
+    c8_remote_names = {
+        "MooncakeConnectorV2",
+        "MooncakePullConnector",
+    }
+    if name in c8_remote_names:
+        return True
+    if name != "MultiConnector":
+        return False
+
+    extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    connectors = extra_config.get("connectors", ())
+    if any(not isinstance(child, dict) or child.get("kv_connector_module_path") for child in connectors):
+        return False
+    names = tuple(child.get("kv_connector") for child in connectors)
+    store_count = names.count("AscendStoreConnector")
+    if store_count > 1 or sum(name in c8_remote_names for name in names) != 1:
+        return False
+    if any(name not in c8_remote_names | {"AscendStoreConnector", "PreemptOffloadConnector"} for name in names):
+        return False
+
+    if getattr(kv_transfer_config, "is_kv_producer", False):
+        if getattr(kv_transfer_config, "kv_role", None) == "kv_both" or store_count != 1 or len(names) != 2:
+            return False
+        if any(child.get("kv_role", "kv_producer") != "kv_producer" for child in connectors):
+            return False
+        store_extra = connectors[names.index("AscendStoreConnector")].get("kv_connector_extra_config") or {}
+        backend = store_extra.get("backend", "mooncake")
+        return isinstance(backend, str) and backend.lower() == "mooncake"
+
+    # MultiConnector picks a single source. A partial Store hit on D would
+    # prevent V2 from pulling the remaining producer blocks.
+    return store_count == 0 and len(names) <= 2
+
+
 def supports_component_major_mla_pd(vllm_config: VllmConfig) -> bool:
     """Whether PD transfer can preserve a component-major MLA cache layout.
 
@@ -111,6 +177,11 @@ def supports_component_major_mla_pd(vllm_config: VllmConfig) -> bool:
     # registry name, so conservatively fall back to the legacy layout.
     if getattr(kv_transfer_config, "kv_connector_module_path", None) is not None:
         return False
+
+    from vllm_ascend.ascend_config import is_kimi_c8_config
+
+    if is_kimi_c8_config(vllm_config):
+        return supports_c8_pd_connector(vllm_config)
 
     return getattr(kv_transfer_config, "kv_connector", None) in {
         "MooncakeConnectorV2",

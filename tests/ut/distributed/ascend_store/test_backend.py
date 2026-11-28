@@ -534,6 +534,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             backend.device_id = 0
             backend.store = MagicMock()
             backend.config = MagicMock()
+            backend.config.enable_ssd_offload = False
             backend.local_seg = "127.0.0.1:1234"
             backend._lazy_init = False
             backend._store_initialized = True
@@ -568,7 +569,7 @@ class TestMooncakeBackendMethods(unittest.TestCase):
             ("put", "batch_put_from_multi_buffers"),
             ("get", "batch_get_into_multi_buffers"),
         ]:
-            for result in ([0], [-1], RuntimeError("backend fail")):
+            for result in ([0], [-200], RuntimeError("backend fail")):
                 with self.subTest(operation=operation, result=result):
                     backend = self._make_backend()
                     method = getattr(backend.store, store_method)
@@ -577,10 +578,32 @@ class TestMooncakeBackendMethods(unittest.TestCase):
                     else:
                         method.return_value = result
                     with patch(module) as logger:
-                        getattr(backend, operation)(["k1"], [[100]], [[10]])
+                        status = getattr(backend, operation)(["k1"], [[100]], [[10]])
+                    if operation == "put":
+                        self.assertIs(status, result == [0])
                     method.assert_called_once()
                     if result != [0]:
                         logger.error.assert_called()
+
+    def test_get_requires_complete_batch_and_byte_counts(self):
+        backend = self._make_backend()
+        get = backend.store.batch_get_into_multi_buffers
+        get.side_effect = [[8, 0], [4, -800], [8]]
+        args = (["a", "b"], [[100, 104], [200]], [[4, 4], [4]])
+        assert backend.get(*args) == [0, -1]
+        assert backend.get(*args) == [-1, -800]
+        assert backend.get(*args) is None
+
+    def test_ssd_put_retries_only_capacity_rejections(self):
+        backend = self._make_backend()
+        backend.config.enable_ssd_offload = True
+        put = backend.store.batch_put_from_multi_buffers
+        put.side_effect = [[0, -200, -1, -200], [0, -200]]
+
+        assert backend.put(["a", "b", "c", "d"], [[1], [2], [3], [4]], [[8]] * 4) is False
+        assert [invocation.args[:3] for invocation in put.call_args_list[1:]] == [
+            (["b", "d"], [[2], [4]], [[8], [8]]),
+        ]
 
     def test_register_buffer(self):
         b = self._make_backend()

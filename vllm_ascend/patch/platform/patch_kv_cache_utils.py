@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable, resolve_dcp_cache_block_sizes
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -150,11 +150,7 @@ def _ascend_resolve_kv_cache_block_sizes(
         # Ascend supports CP with multiple KV cache groups; compute
         # scheduler_block_size using the LCM of all group block sizes
         # multiplied by DCP for proper alignment.
-        scheduler_block_size = math.lcm(*group_block_sizes) * dcp
-        if not cache_config.enable_prefix_caching:
-            return scheduler_block_size, scheduler_block_size
-        hash_block_size = math.gcd(*group_block_sizes)
-        return scheduler_block_size, hash_block_size
+        return resolve_dcp_cache_block_sizes(group_block_sizes, dcp, cache_config.enable_prefix_caching)
 
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
 

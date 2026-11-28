@@ -881,9 +881,16 @@ class MooncakePullRecvingThread(threading.Thread):
                                 + remote_kernel_offset
                             )
                     else:
+                        max_global_blocks = (
+                            (remote_num_prompt_tokens + remote_block_size - 1) // remote_block_size
+                            if remote_num_prompt_tokens > 0
+                            else None
+                        )
                         for local_block_offset, local_block_id in enumerate(local_group_block_ids):
                             local_block_idx = local_start_block_idx + local_block_offset
                             global_block_idx = local_block_idx * local_dcp_size + local_dcp_rank
+                            if max_global_blocks is not None and global_block_idx >= max_global_blocks:
+                                break
                             remote_block_idx = global_block_idx // remote_dcp_size
                             if remote_block_idx >= len(remote_group_block_ids):
                                 break
