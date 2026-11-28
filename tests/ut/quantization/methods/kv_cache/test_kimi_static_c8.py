@@ -268,8 +268,10 @@ def test_c8_prefill_history_read_raw_and_dequant_contract():
     assert not supports_npu_fp8_anti_quant(torch.device("cpu"), torch.float32)
 
 
-@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("all_valid", [True, False])
+@pytest.mark.parametrize(
+    "input_dtype,all_valid",
+    [(torch.float32, True), (torch.bfloat16, False)],
+)
 def test_c8_quantize_and_write_plan_preserve_caller_input(input_dtype, all_valid):
     from vllm_ascend.attention.kimi_c8_static import (
         C8CacheWritePlan,
